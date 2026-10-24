@@ -1,0 +1,17 @@
+[package]
+name = "niruwallpaper"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "MIT"
+description = "Graphical wallpaper settings for the NIRUX desktop"
+
+[dependencies]
+x11rb = { version = "0.13", features = ["randr"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+ab_glyph = "0.2"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
