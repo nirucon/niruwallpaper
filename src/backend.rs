@@ -91,7 +91,8 @@ pub fn find_niructl() -> Option<PathBuf> {
 
 pub fn niructl() -> Result<PathBuf, String> {
     find_niructl().ok_or_else(|| {
-        "the niructl command was not found; install NIRUX or run it from a NIRUX session".to_string()
+        "the niructl command was not found; install NIRUX or run it from a NIRUX session"
+            .to_string()
     })
 }
 
@@ -288,7 +289,10 @@ Holiday\t/home/u/Pictures/holiday.png\n\nbroken line without tab\n";
         assert_eq!(entries[0].name, "Niru Nord");
         assert_eq!(entries[1].name, "Holiday");
         assert!(entries[0].official == entries[0].path.starts_with(expand_home(dir)));
-        assert_eq!(entries[1].path, PathBuf::from("/home/u/Pictures/holiday.png"));
+        assert_eq!(
+            entries[1].path,
+            PathBuf::from("/home/u/Pictures/holiday.png")
+        );
     }
 
     #[test]

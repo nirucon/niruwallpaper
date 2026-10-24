@@ -54,10 +54,8 @@ impl Font {
         let mut pen_x = 0.0f32;
         for ch in text.chars() {
             let glyph_id = self.face.glyph_id(ch);
-            let glyph = glyph_id.with_scale_and_position(
-                PxScale::from(self.size),
-                point(pen_x, ascent as f32),
-            );
+            let glyph = glyph_id
+                .with_scale_and_position(PxScale::from(self.size), point(pen_x, ascent as f32));
             if let Some(outline) = self.face.outline_glyph(glyph) {
                 let bounds = outline.px_bounds();
                 outline.draw(|gx, gy, coverage| {
@@ -66,7 +64,7 @@ impl Font {
                     if x < 0 || y < 0 || x >= width as i32 || y >= height as i32 {
                         return;
                     }
-                    let a = coverage.clamp(0.0, 1.0) as f32;
+                    let a = coverage.clamp(0.0, 1.0);
                     let idx = ((y as u32 * width + x as u32) * 4) as usize;
                     pixels[idx] = mix(br, fr, a);
                     pixels[idx + 1] = mix(bg_, fg, a);

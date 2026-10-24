@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <!-- A framed picture: the wallpaper lives on a screen, not on a file. -->
+  <rect x="24" y="48" width="208" height="140" rx="6" fill="none" stroke="#e5e5e5" stroke-width="8"/>
+  <rect x="44" y="68" width="168" height="100" fill="#2a2a2d"/>
+  <!-- A low horizon and one moon, the shape the NIRUX wallpapers share. -->
+  <circle cx="150" cy="104" r="16" fill="#e5e5e5"/>
+  <path d="M44 148 L92 108 L128 138 L160 116 L212 152 L212 168 L44 168 Z" fill="#a8a8a8"/>
+  <!-- The stand. -->
+  <rect x="108" y="188" width="40" height="16" fill="#e5e5e5"/>
+  <rect x="80" y="204" width="96" height="10" rx="3" fill="#e5e5e5"/>
+</svg>

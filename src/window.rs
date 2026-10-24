@@ -107,11 +107,19 @@ pub fn load() -> Result<State, String> {
         message_is_error: false,
     };
     if let Some(active) = state.status.active_image().map(Path::new) {
-        if let Some(pos) = state.visible().iter().position(|w| w.path.as_path() == active) {
+        if let Some(pos) = state
+            .visible()
+            .iter()
+            .position(|w| w.path.as_path() == active)
+        {
             state.selected = pos;
         } else if state.visible().iter().any(|w| !w.official) {
             state.tab = Tab::Mine;
-            if let Some(pos) = state.visible().iter().position(|w| w.path.as_path() == active) {
+            if let Some(pos) = state
+                .visible()
+                .iter()
+                .position(|w| w.path.as_path() == active)
+            {
                 state.selected = pos;
             }
         }
@@ -123,7 +131,10 @@ pub fn load() -> Result<State, String> {
 ///
 /// Returns the error text; the caller decides whether it is fatal.
 fn check_screen(c: &RustConnection) -> Result<(), String> {
-    let root = c.get_geometry(c.setup().roots[0].root).map_err(|e| e.to_string())?.reply();
+    let root = c
+        .get_geometry(c.setup().roots[0].root)
+        .map_err(|e| e.to_string())?
+        .reply();
     let root = root.map_err(|e| e.to_string())?;
     if ![24, 32].contains(&root.depth) {
         return Err(format!(
@@ -190,7 +201,8 @@ impl App {
         let palette = theme::load();
         let font = crate::text::Font::load(palette);
         let keys = Keys::new(&c)?;
-        let image_lsb = c.setup().image_byte_order == x11rb::protocol::xproto::ImageOrder::LSB_FIRST;
+        let image_lsb =
+            c.setup().image_byte_order == x11rb::protocol::xproto::ImageOrder::LSB_FIRST;
 
         let win = c.generate_id().map_err(|e| e.to_string())?;
         c.create_window(
@@ -237,8 +249,14 @@ impl App {
         c.sync().map_err(|e| e.to_string())?;
 
         let name = APP_NAME.as_bytes();
-        c.change_property8(PropMode::REPLACE, win, AtomEnum::WM_NAME, AtomEnum::STRING, name)
-            .map_err(|e| e.to_string())?;
+        c.change_property8(
+            PropMode::REPLACE,
+            win,
+            AtomEnum::WM_NAME,
+            AtomEnum::STRING,
+            name,
+        )
+        .map_err(|e| e.to_string())?;
         c.change_property8(
             PropMode::REPLACE,
             win,
@@ -361,14 +379,25 @@ impl App {
 
 impl App {
     fn label(&self, x: i16, y: i16, text: &str, colour: u32, size: f32) -> Result<(), String> {
-        let (w, h, pixels) = self.font.size(size).render(text, colour, self.palette.background);
+        let (w, h, pixels) = self
+            .font
+            .size(size)
+            .render(text, colour, self.palette.background);
         if w == 0 || h == 0 {
             return Ok(());
         }
         self.upload(x, y, w as u16, h as u16, &pixels)
     }
 
-    fn label_on(&self, x: i16, y: i16, text: &str, colour: u32, bg: u32, size: f32) -> Result<(), String> {
+    fn label_on(
+        &self,
+        x: i16,
+        y: i16,
+        text: &str,
+        colour: u32,
+        bg: u32,
+        size: f32,
+    ) -> Result<(), String> {
         let (w, h, pixels) = self.font.size(size).render(text, colour, bg);
         if w == 0 || h == 0 {
             return Ok(());
@@ -383,7 +412,14 @@ impl App {
             (self.palette.surface, self.palette.foreground)
         };
         self.fill(bg, r)?;
-        self.fill(self.palette.border, Rectangle { width: r.width, height: 1, ..r })?;
+        self.fill(
+            self.palette.border,
+            Rectangle {
+                width: r.width,
+                height: 1,
+                ..r
+            },
+        )?;
         let (_, text_h, _) = self.font.size(13.0).render(text, fg, bg);
         let y = r.y + (i16::try_from(text_h).unwrap_or(0) - 8).max(0) / 2;
         self.label_on(r.x + 8, y, text, fg, bg, 13.0)
@@ -393,12 +429,15 @@ impl App {
     /// disagree about where a control is.
     pub fn paint(&self, state: &State) -> Result<(), String> {
         let l = layout(self.w, self.h);
-        self.fill(self.palette.background, Rectangle {
-            x: 0,
-            y: 0,
-            width: self.w,
-            height: self.h,
-        })?;
+        self.fill(
+            self.palette.background,
+            Rectangle {
+                x: 0,
+                y: 0,
+                width: self.w,
+                height: self.h,
+            },
+        )?;
         self.label(PAD, PAD - 8, APP_NAME, self.palette.foreground, 20.0)?;
         self.label(
             PAD,
@@ -449,7 +488,14 @@ impl App {
                 self.palette.border
             };
             self.fill(self.palette.surface, rect)?;
-            self.fill(border, Rectangle { width: rect.width, height: 2, ..rect })?;
+            self.fill(
+                border,
+                Rectangle {
+                    width: rect.width,
+                    height: 2,
+                    ..rect
+                },
+            )?;
             // The preview is cached on disk keyed by the file's identity, so
             // this is a file check on every repaint rather than a decode.
             let thumb = thumbs::thumbnail(&entry.path);
@@ -469,7 +515,13 @@ impl App {
                     }
                 }
                 None => {
-                    self.label(rect.x + 6, rect.y + 8, "(no preview)", self.palette.muted, 11.0)?;
+                    self.label(
+                        rect.x + 6,
+                        rect.y + 8,
+                        "(no preview)",
+                        self.palette.muted,
+                        11.0,
+                    )?;
                 }
             }
             let label = truncate(&entry.name, 18);
@@ -488,7 +540,13 @@ impl App {
 
         // Panel.
         self.fill(self.palette.surface, l.panel)?;
-        self.label(l.panel.x + 12, l.panel.y + 4, "Scale", self.palette.muted, 12.0)?;
+        self.label(
+            l.panel.x + 12,
+            l.panel.y + 4,
+            "Scale",
+            self.palette.muted,
+            12.0,
+        )?;
         let scale = state
             .pending
             .scale
@@ -497,8 +555,17 @@ impl App {
         for (i, rect) in scale_rects(&l).iter().enumerate() {
             self.button(*rect, SCALES[i], SCALES[i] == scale)?;
         }
-        self.label(l.panel.x + 12, l.panel.y + 148, "Rotate (minutes)", self.palette.muted, 12.0)?;
-        let rotation = state.pending.rotation.unwrap_or(state.status.rotation_minutes);
+        self.label(
+            l.panel.x + 12,
+            l.panel.y + 148,
+            "Rotate (minutes)",
+            self.palette.muted,
+            12.0,
+        )?;
+        let rotation = state
+            .pending
+            .rotation
+            .unwrap_or(state.status.rotation_minutes);
         for (i, rect) in rotation_rects(&l).iter().enumerate() {
             let text = if ROTATIONS[i] == 0 {
                 "Off".to_string()
@@ -511,7 +578,15 @@ impl App {
             .pending
             .follow_theme
             .unwrap_or(state.status.follow_theme);
-        self.button(follow_rect(&l), if follow { "Follow theme: on" } else { "Follow theme: off" }, follow)?;
+        self.button(
+            follow_rect(&l),
+            if follow {
+                "Follow theme: on"
+            } else {
+                "Follow theme: off"
+            },
+            follow,
+        )?;
         self.label(
             l.panel.x + 12,
             l.panel.y + 290,
@@ -546,17 +621,7 @@ impl App {
 
     pub fn flush(&self) -> Result<(), String> {
         self.c
-            .copy_area(
-                self.back,
-                self.win,
-                self.gc,
-                0,
-                0,
-                0,
-                0,
-                self.w,
-                self.h,
-            )
+            .copy_area(self.back, self.win, self.gc, 0, 0, 0, 0, self.w, self.h)
             .map_err(|e| e.to_string())?;
         self.c.flush().map_err(|e| e.to_string())
     }
@@ -672,7 +737,10 @@ pub fn layout(w: u16, h: u16) -> Layout {
 /// The clickable region at a point, if any.
 pub fn hit(w: u16, h: u16, x: i16, y: i16, state: &State) -> Option<Hit> {
     let l = layout(w, h);
-    for (rect, hit) in [(l.tabs.0, Hit::Tab(Tab::Official)), (l.tabs.1, Hit::Tab(Tab::Mine))] {
+    for (rect, hit) in [
+        (l.tabs.0, Hit::Tab(Tab::Official)),
+        (l.tabs.1, Hit::Tab(Tab::Mine)),
+    ] {
         if inside(rect, x, y) {
             return Some(hit);
         }
@@ -787,105 +855,6 @@ fn cancel_rect(l: &Layout) -> Rectangle {
         y: l.panel.y + l.panel.height as i16 - 52,
         width: PANEL_W as u16 - 24,
         height: 32,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn state() -> State {
-        State {
-            status: Status::default(),
-            list: vec![],
-            tab: Tab::Official,
-            selected: 0,
-            scroll: 0,
-            pending: Pending::default(),
-            message: String::new(),
-            message_is_error: false,
-        }
-    }
-
-    #[test]
-    fn tiles_fit_the_list_width() {
-        let l = layout(960, 640);
-        assert!(l.tiles_per_row >= 3, "{} tiles per row", l.tiles_per_row);
-        let right = l.left.x + l.tiles_per_row as i16 * TILE_W;
-        assert!(right <= l.panel.x, "tiles overlap the panel");
-    }
-
-    #[test]
-    fn the_smallest_window_still_shows_tiles() {
-        let l = layout(MIN_WIDTH, MIN_HEIGHT);
-        assert!(l.tiles_per_row >= 1, "no column at the minimum width");
-        assert!(l.visible_rows >= 1, "no row at the minimum height");
-        // The list must not be squeezed under the header or the panel.
-        assert!(l.left.height > 0 && l.panel.height > 0);
-    }
-
-    #[test]
-    fn clicks_on_the_tabs_are_recognised() {
-        let s = state();
-        let l = layout(960, 640);
-        let p = (l.tabs.0.x + 2, l.tabs.0.y + 2);
-        assert_eq!(hit(960, 640, p.0, p.1, &s), Some(Hit::Tab(Tab::Official)));
-        let p = (l.tabs.1.x + 2, l.tabs.1.y + 2);
-        assert_eq!(hit(960, 640, p.0, p.1, &s), Some(Hit::Tab(Tab::Mine)));
-    }
-
-    #[test]
-    fn the_apply_button_is_inside_the_panel() {
-        let l = layout(960, 640);
-        let r = apply_rect(&l);
-        assert!(r.x >= l.panel.x);
-        assert!(r.y + r.height as i16 <= l.panel.y + l.panel.height as i16);
-    }
-
-    #[test]
-    fn an_empty_area_is_not_a_click() {
-        let s = state();
-        assert_eq!(hit(960, 640, 5, 5, &s), None);
-    }
-
-    #[test]
-    fn picking_an_image_stops_theme_following_in_the_same_step() {
-        let mut s = state();
-        s.status.follow_theme = true;
-        s.list = vec![Wallpaper {
-            name: "Nord".into(),
-            path: PathBuf::from("/w/Nord.png"),
-            official: true,
-        }];
-        select_current(&mut s);
-        assert_eq!(s.pending.image, Some(PathBuf::from("/w/Nord.png")));
-        assert_eq!(
-            s.pending.follow_theme,
-            Some(false),
-            "choosing an image must not leave theme following on"
-        );
-    }
-
-    #[test]
-    fn applying_both_workflows_at_once_is_refused() {
-        let mut s = state();
-        s.pending.image = Some(PathBuf::from("/w/own.png"));
-        s.pending.follow_theme = Some(true);
-        let err = apply(&mut s).expect_err("a contradictory request must not be applied");
-        assert!(err.contains("either"), "{err}");
-    }
-
-    #[test]
-    fn a_pending_set_knows_when_it_is_empty() {
-        let mut p = Pending::default();
-        assert!(p.is_empty());
-        p.scale = Some("fit".into());
-        assert!(!p.is_empty());
-    }
-
-    #[test]
-    fn rotation_options_include_off() {
-        assert_eq!(ROTATIONS[0], 0, "the first rotation option turns it off");
     }
 }
 
@@ -1066,7 +1035,11 @@ pub fn select_current(state: &mut State) {
         // following is on would leave the user with a choice they cannot
         // predict: `wallpaper set` writes mode=single, which stops the theme
         // wallpaper from showing anyway. Say so instead of mixing states.
-        if state.pending.follow_theme.unwrap_or(state.status.follow_theme) {
+        if state
+            .pending
+            .follow_theme
+            .unwrap_or(state.status.follow_theme)
+        {
             state.pending.follow_theme = Some(false);
             state.set_message(
                 format!("Stage {name} — this replaces the theme wallpaper"),
@@ -1174,4 +1147,103 @@ fn handle_click(app: &App, state: &mut State, e: &ButtonPressEvent) -> Result<bo
         None => {}
     }
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn state() -> State {
+        State {
+            status: Status::default(),
+            list: vec![],
+            tab: Tab::Official,
+            selected: 0,
+            scroll: 0,
+            pending: Pending::default(),
+            message: String::new(),
+            message_is_error: false,
+        }
+    }
+
+    #[test]
+    fn tiles_fit_the_list_width() {
+        let l = layout(960, 640);
+        assert!(l.tiles_per_row >= 3, "{} tiles per row", l.tiles_per_row);
+        let right = l.left.x + l.tiles_per_row as i16 * TILE_W;
+        assert!(right <= l.panel.x, "tiles overlap the panel");
+    }
+
+    #[test]
+    fn the_smallest_window_still_shows_tiles() {
+        let l = layout(MIN_WIDTH, MIN_HEIGHT);
+        assert!(l.tiles_per_row >= 1, "no column at the minimum width");
+        assert!(l.visible_rows >= 1, "no row at the minimum height");
+        // The list must not be squeezed under the header or the panel.
+        assert!(l.left.height > 0 && l.panel.height > 0);
+    }
+
+    #[test]
+    fn clicks_on_the_tabs_are_recognised() {
+        let s = state();
+        let l = layout(960, 640);
+        let p = (l.tabs.0.x + 2, l.tabs.0.y + 2);
+        assert_eq!(hit(960, 640, p.0, p.1, &s), Some(Hit::Tab(Tab::Official)));
+        let p = (l.tabs.1.x + 2, l.tabs.1.y + 2);
+        assert_eq!(hit(960, 640, p.0, p.1, &s), Some(Hit::Tab(Tab::Mine)));
+    }
+
+    #[test]
+    fn the_apply_button_is_inside_the_panel() {
+        let l = layout(960, 640);
+        let r = apply_rect(&l);
+        assert!(r.x >= l.panel.x);
+        assert!(r.y + r.height as i16 <= l.panel.y + l.panel.height as i16);
+    }
+
+    #[test]
+    fn an_empty_area_is_not_a_click() {
+        let s = state();
+        assert_eq!(hit(960, 640, 5, 5, &s), None);
+    }
+
+    #[test]
+    fn picking_an_image_stops_theme_following_in_the_same_step() {
+        let mut s = state();
+        s.status.follow_theme = true;
+        s.list = vec![Wallpaper {
+            name: "Nord".into(),
+            path: PathBuf::from("/w/Nord.png"),
+            official: true,
+        }];
+        select_current(&mut s);
+        assert_eq!(s.pending.image, Some(PathBuf::from("/w/Nord.png")));
+        assert_eq!(
+            s.pending.follow_theme,
+            Some(false),
+            "choosing an image must not leave theme following on"
+        );
+    }
+
+    #[test]
+    fn applying_both_workflows_at_once_is_refused() {
+        let mut s = state();
+        s.pending.image = Some(PathBuf::from("/w/own.png"));
+        s.pending.follow_theme = Some(true);
+        let err = apply(&mut s).expect_err("a contradictory request must not be applied");
+        assert!(err.contains("either"), "{err}");
+    }
+
+    #[test]
+    fn a_pending_set_knows_when_it_is_empty() {
+        let mut p = Pending::default();
+        assert!(p.is_empty());
+        p.scale = Some("fit".into());
+        assert!(!p.is_empty());
+    }
+
+    #[test]
+    fn rotation_options_include_off() {
+        assert_eq!(ROTATIONS[0], 0, "the first rotation option turns it off");
+    }
 }

@@ -29,9 +29,9 @@ impl Palette {
     /// Derived rather than themed so the window keeps working with the five
     /// keys a theme actually defines.
     fn surface_from(background: u32) -> u32 {
-        let r = ((background >> 16) & 0xff) as u32;
-        let g = ((background >> 8) & 0xff) as u32;
-        let b = (background & 0xff) as u32;
+        let r = (background >> 16) & 0xff;
+        let g = (background >> 8) & 0xff;
+        let b = background & 0xff;
         let lift = |v: u32| (v + 10).min(255);
         (lift(r) << 16) | (lift(g) << 8) | lift(b)
     }

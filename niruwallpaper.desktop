@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=NIRU Wallpaper
+Comment=Choose the desktop wallpaper and how it is shown
+Keywords=Wallpaper;Background;Appearance;Theme;
+Exec=niruwallpaper
+Icon=niruwallpaper
+Terminal=false
+Categories=Settings;DesktopSettings;Qt;
+StartupNotify=false
