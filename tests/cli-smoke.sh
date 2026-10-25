@@ -23,11 +23,16 @@ if "$bin" nonsense >/dev/null 2>&1; then fail 'an unknown command succeeded'; fi
 # `set` without a path must be refused before touching any setting.
 if "$bin" set >/dev/null 2>&1; then fail 'set without a path succeeded'; fi
 
+# A missing argument is named rather than opening a window.
+"$bin" --help | grep -q 'screen' || fail '--help does not mention the per-screen status'
+
 # Without a desktop installed, the state commands must explain themselves and
 # fail, not print empty settings.
-if HOME="$tmp" PATH=/nonexistent "$bin" status >/dev/null 2>"$tmp/err"; then
-  fail 'status succeeded without niructl'
-fi
-grep -q 'niructl' "$tmp/err" || fail 'status did not explain the missing niructl'
+for command in status list; do
+  if HOME="$tmp" PATH=/nonexistent "$bin" "$command" >/dev/null 2>"$tmp/err"; then
+    fail "$command succeeded without niructl"
+  fi
+  grep -q 'niructl' "$tmp/err" || fail "$command did not explain the missing niructl"
+done
 
 printf 'cli-smoke: ok\n'

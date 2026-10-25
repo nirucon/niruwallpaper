@@ -4,42 +4,75 @@
 //! state schedules a full repaint, which is then copied to the window in one
 //! request, so nothing flickers and the state machine stays small.
 
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    sync::{
+        mpsc::{self, Receiver, Sender},
+        Arc, Mutex,
+    },
+    thread,
+    time::{Duration, Instant},
+};
 
 use x11rb::{
     connection::Connection,
-    protocol::{xproto::*, Event},
+    protocol::{randr::ConnectionExt as _, xproto::*, Event},
     rust_connection::RustConnection,
     wrapper::ConnectionExt as _,
     COPY_DEPTH_FROM_PARENT,
 };
 
-use crate::backend::{self, Status, Wallpaper};
+use crate::backend::{self, Change, Status, Wallpaper};
+use crate::screens::{self, Screen};
 use crate::theme::{self, Palette};
 use crate::thumbs;
 
 pub const APP_ID: &str = "niruwallpaper";
 pub const APP_NAME: &str = "NIRU Wallpaper";
 
-const WIDTH: u16 = 960;
-const HEIGHT: u16 = 640;
-const MIN_WIDTH: u16 = 640;
-const MIN_HEIGHT: u16 = 480;
+const WIDTH: u16 = 1000;
+const HEIGHT: u16 = 690;
+const MIN_WIDTH: u16 = 660;
+const MIN_HEIGHT: u16 = 500;
 
 const PAD: i16 = 20;
 const ROW: i16 = 26;
 const HEADER: i16 = 100;
-const THUMB: u16 = 96;
 const TILE_W: i16 = 148;
 const TILE_H: i16 = 132;
-const PANEL_W: i16 = 250;
-const FOOTER: i16 = 76;
+const PANEL_W: i16 = 300;
+const FOOTER: i16 = 86;
+
+/// How often the window asks the desktop whether anything changed.
+///
+/// Five calls to a local program a second with no user interaction is cheap,
+/// and it is what a theme change, another program's edit or a monitor change
+/// needs to appear without a restart. Nothing is rendered unless it changed.
+const REFRESH: Duration = Duration::from_millis(1000);
 
 /// Which list is showing.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Tab {
     Official,
     Mine,
+}
+
+/// Which screen a choice is for.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Target {
+    /// Every screen without its own settings.
+    All,
+    /// One named screen.
+    Screen(String),
+}
+
+impl Target {
+    pub fn label(&self) -> String {
+        match self {
+            Target::All => "All screens".to_string(),
+            Target::Screen(name) => screen_label(name),
+        }
+    }
 }
 
 /// Changes the user has staged but not applied.
@@ -49,6 +82,8 @@ pub struct Pending {
     pub scale: Option<String>,
     pub rotation: Option<u32>,
     pub follow_theme: Option<bool>,
+    /// Drop the target screen's own settings.
+    pub inherit: bool,
 }
 
 impl Pending {
@@ -57,6 +92,7 @@ impl Pending {
             && self.scale.is_none()
             && self.rotation.is_none()
             && self.follow_theme.is_none()
+            && !self.inherit
     }
 }
 
@@ -64,11 +100,19 @@ pub struct State {
     pub status: Status,
     pub list: Vec<Wallpaper>,
     pub tab: Tab,
+    pub target: Target,
     pub selected: usize,
     pub scroll: usize,
     pub pending: Pending,
     pub message: String,
     pub message_is_error: bool,
+    /// What the desktop said when the window last loaded, so a change made
+    /// elsewhere is noticed. Pending edits are never discarded by a refresh.
+    pub seen: String,
+    /// Set while applying, so the window cannot start a second transaction.
+    pub busy: bool,
+    /// The palette the window was last drawn with.
+    pub palette: Palette,
 }
 
 impl State {
@@ -90,22 +134,113 @@ impl State {
         self.message = text.into();
         self.message_is_error = error;
     }
+
+    /// The names of every connected screen, in the order the desktop reports.
+    pub fn screens(&self) -> Vec<String> {
+        self.status
+            .screens
+            .iter()
+            .map(|s| s.output.clone())
+            .collect()
+    }
+
+    /// True when the desktop has more than one screen.
+    pub fn multi_screen(&self) -> bool {
+        self.screens().len() > 1
+    }
+
+    pub fn screen_plan(&self, name: &str) -> Option<&backend::ScreenPlan> {
+        self.status.screens.iter().find(|s| s.output == name)
+    }
+
+    pub fn screen_rendered(&self, name: &str) -> Option<&backend::ScreenRendered> {
+        self.status.rendered.iter().find(|s| s.output == name)
+    }
+
+    /// Whether changes now apply to one screen's own settings.
+    pub fn override_target(&self) -> bool {
+        matches!(self.target, Target::Screen(_))
+    }
+
+    fn active_screen_name(&self) -> Option<&str> {
+        match &self.target {
+            Target::Screen(name) => Some(name),
+            Target::All => None,
+        }
+    }
+
+    /// The state changes a refresh should not silently overwrite.
+    pub fn has_pending(&self) -> bool {
+        !self.pending.is_empty()
+    }
+}
+
+/// A snapshot of everything the window shows.
+fn snapshot(status: &Status, list: &[Wallpaper]) -> String {
+    let mut out = format!(
+        "{:?}|{:?}|{:?}|{}|{}|{}|{}|{:?}|",
+        status.enabled,
+        status.mode,
+        status.rotation_minutes,
+        status.scale,
+        status.follow_theme,
+        status.file,
+        status.theme,
+        status.theme_image
+    );
+    for screen in &status.screens {
+        out.push_str(&format!(
+            "{}:{}:{}:{}:{};",
+            screen.output, screen.source, screen.kind, screen.scale, screen.image
+        ));
+    }
+    for rendered in &status.rendered {
+        out.push_str(&format!(
+            "{}:{}:{}:{}:{};",
+            rendered.output, rendered.kind, rendered.image, rendered.scale, rendered.note
+        ));
+    }
+    for entry in &status.overrides {
+        out.push_str(&format!(
+            "{}:{}:{}:{};",
+            entry.output, entry.mode, entry.file, entry.scale
+        ));
+    }
+    for entry in list {
+        out.push_str(&format!("{}:{};", entry.path.display(), entry.official));
+    }
+    out
+}
+
+/// Read everything the window shows from the desktop.
+pub fn fetch() -> Result<(Status, Vec<Wallpaper>), String> {
+    let status = backend::read_status()?;
+    let list = backend::read_list(&status.theme_dir)?;
+    Ok((status, list))
 }
 
 /// Load everything the window shows.
 pub fn load() -> Result<State, String> {
-    let status = backend::read_status()?;
-    let list = backend::read_list(&status.theme_dir)?;
+    let (status, list) = fetch()?;
+    let seen = snapshot(&status, &list);
     let mut state = State {
         status,
         list,
         tab: Tab::Official,
+        target: Target::All,
         selected: 0,
         scroll: 0,
         pending: Pending::default(),
         message: String::new(),
         message_is_error: false,
+        seen,
+        busy: false,
+        palette: theme::load(),
     };
+    if state.multi_screen() {
+        // A second screen is the reason this window grew a screen choice.
+        state.target = Target::All;
+    }
     if let Some(active) = state.status.active_image().map(Path::new) {
         if let Some(pos) = state
             .visible()
@@ -125,6 +260,62 @@ pub fn load() -> Result<State, String> {
         }
     }
     Ok(state)
+}
+
+/// Take a fresh report from the desktop.
+///
+/// Returns whether anything the window shows changed. A staged change is
+/// kept, and the footer says that new settings arrived meanwhile instead of
+/// silently replacing the user's own.
+pub fn refresh(state: &mut State) -> Result<bool, String> {
+    let (status, list) = fetch()?;
+    let snapshot = snapshot(&status, &list);
+    let changed = snapshot != state.seen;
+    let selected_path = state.current().map(|w| w.path.clone());
+    let target_still_there = match &state.target {
+        Target::Screen(name) => status.screens.iter().any(|s| &s.output == name),
+        Target::All => true,
+    };
+    state.palette = theme::load();
+    if changed && state.has_pending() {
+        state.message = "The desktop changed elsewhere. Your staged changes were kept; Apply uses them as they are, Discard takes the new state.".into();
+        state.message_is_error = false;
+    }
+    state.status = status;
+    state.list = list;
+    state.seen = snapshot;
+    if !target_still_there {
+        state.target = Target::All;
+        state.pending = Pending::default();
+    }
+    if let Some(path) = selected_path {
+        let visible = state.visible();
+        if visible.is_empty() {
+            state.selected = 0;
+            state.scroll = 0;
+        } else {
+            state.tab = if visible
+                .iter()
+                .any(|w| w.official == (state.tab == Tab::Official))
+            {
+                state.tab
+            } else if visible.iter().any(|w| w.official) {
+                Tab::Official
+            } else {
+                Tab::Mine
+            };
+            let visible = state.visible();
+            let pos = visible
+                .iter()
+                .position(|w| w.path == path)
+                .unwrap_or_else(|| visible.len().saturating_sub(1));
+            state.selected = pos;
+        }
+    }
+    if state.selected >= state.visible().len() {
+        state.selected = state.visible().len().saturating_sub(1);
+    }
+    Ok(changed)
 }
 
 /// Refuse to run over a screen that cannot take a 24-bit image.
@@ -174,6 +365,12 @@ fn atom_id(atoms: &[(&'static str, u32)], name: &str) -> u32 {
         .unwrap_or(0)
 }
 
+/// A thumbnail that arrived from a worker thread.
+pub struct Thumb {
+    pub path: PathBuf,
+    pub image: Option<image::RgbaImage>,
+}
+
 pub struct App {
     c: RustConnection,
     win: Window,
@@ -182,7 +379,7 @@ pub struct App {
     w: u16,
     h: u16,
     atoms: Vec<(&'static str, u32)>,
-    palette: Palette,
+    pub palette: Palette,
     font: crate::text::Font,
     keys: Keys,
     /// True when the server wants the least significant byte first, which
@@ -190,12 +387,38 @@ pub struct App {
     image_lsb: bool,
     root: Window,
     depth: u8,
+    /// Decoded previews, so a repaint never decodes an image.
+    thumbs: std::collections::HashMap<PathBuf, Option<image::RgbaImage>>,
+    /// Previews that failed, and when, so a broken file is not retried on
+    /// every repaint but a replaced file is.
+    failed: std::collections::HashMap<PathBuf, Instant>,
+    /// The screens RandR reports now.
+    pub screens: Vec<Screen>,
+    /// The screens seen on the last refresh, so a cable change is noticed.
+    seen_screens: String,
+    /// The screen index of the X connection, kept for re-reading RandR.
+    xscreen: usize,
+    requests: Sender<(u64, PathBuf)>,
+    results: Receiver<(u64, Thumb)>,
+    request_serial: u64,
+    /// The refresh timer restarts when a key or click happens, so it never
+    /// interrupts typing.
+    last_activity: Instant,
+    /// True when a monitor configuration change was seen; the screens are
+    /// then re-read from RandR without waiting for the next refresh.
+    screens_dirty: bool,
 }
 
 impl App {
     pub fn open() -> Result<Self, String> {
         let (c, screen) = x11rb::connect(None).map_err(|e| e.to_string())?;
         check_screen(&c)?;
+        let screens = screens::read(&c, screen)?;
+        let seen_screens = screens
+            .iter()
+            .map(|s| format!("{}:{},{},{}x{}", s.name, s.x, s.y, s.width, s.height))
+            .collect::<Vec<_>>()
+            .join(";");
         let root = c.setup().roots[screen].root;
         let atoms = intern(&c)?;
         let palette = theme::load();
@@ -273,15 +496,16 @@ impl App {
             format!("{APP_ID}\0{APP_ID}\0").as_bytes(),
         )
         .map_err(|e| e.to_string())?;
-        // A fixed size: every control has a position computed from the window
-        // size, so letting a window manager resize it would only move the
-        // panel around. min and max are equal, which is how hints express that.
+        // A resizable window within the sizes the layout supports, so it stays
+        // usable on a small screen and gains room on a wide one.
         let mut hints = vec![0u32; 18];
-        hints[0] = 1 << 4 | 1 << 5; // min size, max size
-        hints[5] = u32::from(WIDTH);
-        hints[6] = u32::from(HEIGHT);
-        hints[7] = u32::from(WIDTH);
-        hints[8] = u32::from(HEIGHT);
+        hints[0] = 1 << 4 | 1 << 5 | 1 << 10 | 1 << 11; // min, max, base
+        hints[5] = u32::from(MIN_WIDTH);
+        hints[6] = u32::from(MIN_HEIGHT);
+        hints[7] = 1;
+        hints[8] = 1;
+        hints[9] = PAD as u32;
+        hints[10] = PAD as u32;
         c.change_property32(
             PropMode::REPLACE,
             win,
@@ -300,6 +524,13 @@ impl App {
         .map_err(|e| e.to_string())?;
         c.map_window(win).map_err(|e| e.to_string())?;
         c.sync().map_err(|e| e.to_string())?;
+        // Ask for RandR events so a monitor change makes the window re-read
+        // its screens; a server without RandR keeps working without them.
+        let _ = c.randr_select_input(root, x11rb::protocol::randr::NotifyMask::SCREEN_CHANGE);
+
+        let (requests, work) = mpsc::channel::<(u64, PathBuf)>();
+        let (done, results) = mpsc::channel::<(u64, Thumb)>();
+        spawn_workers(work, done);
 
         Ok(Self {
             c,
@@ -315,7 +546,35 @@ impl App {
             image_lsb,
             root,
             depth,
+            thumbs: std::collections::HashMap::new(),
+            failed: std::collections::HashMap::new(),
+            screens,
+            seen_screens,
+            xscreen: screen,
+            requests,
+            results,
+            request_serial: 0,
+            last_activity: Instant::now(),
+            screens_dirty: false,
         })
+    }
+
+    /// Re-read the screens from RandR. Returns true when they changed.
+    pub fn reread_screens(&mut self) -> bool {
+        let Ok(screens) = screens::read(&self.c, self.xscreen) else {
+            return false;
+        };
+        let seen = screens
+            .iter()
+            .map(|s| format!("{}:{},{},{}x{}", s.name, s.x, s.y, s.width, s.height))
+            .collect::<Vec<_>>()
+            .join(";");
+        if seen == self.seen_screens {
+            return false;
+        }
+        self.seen_screens = seen;
+        self.screens = screens;
+        true
     }
 
     fn resize_backing(&mut self) -> Result<(), String> {
@@ -325,6 +584,43 @@ impl App {
             .map_err(|e| e.to_string())?;
         let old = std::mem::replace(&mut self.back, pixmap);
         self.c.free_pixmap(old).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// A one-pixel focus ring just outside a control.
+    fn ring(&self, r: Rectangle) -> Result<(), String> {
+        let outer = Rectangle {
+            x: r.x - 2,
+            y: r.y - 2,
+            width: r.width + 4,
+            height: r.height + 4,
+        };
+        for edge in [
+            Rectangle {
+                width: outer.width,
+                height: 1,
+                ..outer
+            },
+            Rectangle {
+                y: outer.y + outer.height as i16 - 1,
+                width: outer.width,
+                height: 1,
+                ..outer
+            },
+            Rectangle {
+                width: 1,
+                height: outer.height,
+                ..outer
+            },
+            Rectangle {
+                x: outer.x + outer.width as i16 - 1,
+                width: 1,
+                height: outer.height,
+                ..outer
+            },
+        ] {
+            self.fill(self.palette.foreground, edge)?;
+        }
         Ok(())
     }
 
@@ -375,9 +671,31 @@ impl App {
             .check()
             .map_err(|e| e.to_string())
     }
-}
 
-impl App {
+    /// Draw a picture scaled by cropping so it fills the rectangle, the way
+    /// `fill` scales a wallpaper. Nothing is stretched out of shape.
+    fn image_fill(&self, r: Rectangle, image: &image::RgbaImage) -> Result<(), String> {
+        let (iw, ih) = (image.width(), image.height());
+        if iw == 0 || ih == 0 || r.width == 0 || r.height == 0 {
+            return Ok(());
+        }
+        let scale = f64::from(r.width) / f64::from(iw);
+        let scale = scale.max(f64::from(r.height) / f64::from(ih));
+        let tw = (f64::from(iw) * scale).round().max(f64::from(r.width)) as u32;
+        let th = (f64::from(ih) * scale).round().max(f64::from(r.height)) as u32;
+        let scaled = image::imageops::resize(image, tw, th, image::imageops::FilterType::Triangle);
+        let x0 = (tw - u32::from(r.width)) / 2;
+        let y0 = (th - u32::from(r.height)) / 2;
+        let mut pixels = Vec::with_capacity(usize::from(r.width) * usize::from(r.height) * 4);
+        for y in y0..y0 + u32::from(r.height) {
+            for x in x0..x0 + u32::from(r.width) {
+                let p = scaled.get_pixel(x, y);
+                pixels.extend_from_slice(&p.0);
+            }
+        }
+        self.upload(r.x, r.y, r.width, r.height, &pixels)
+    }
+
     fn label(&self, x: i16, y: i16, text: &str, colour: u32, size: f32) -> Result<(), String> {
         let (w, h, pixels) = self
             .font
@@ -405,8 +723,10 @@ impl App {
         self.upload(x, y, w as u16, h as u16, &pixels)
     }
 
-    fn button(&self, r: Rectangle, text: &str, active: bool) -> Result<(), String> {
-        let (bg, fg) = if active {
+    fn button(&self, r: Rectangle, text: &str, active: bool, enabled: bool) -> Result<(), String> {
+        let (bg, fg) = if !enabled {
+            (self.palette.background, self.palette.border)
+        } else if active {
             (self.palette.accent, self.palette.background)
         } else {
             (self.palette.surface, self.palette.foreground)
@@ -425,9 +745,48 @@ impl App {
         self.label_on(r.x + 8, y, text, fg, bg, 13.0)
     }
 
+    fn selected(&self, hit: Option<Hit>, want: Hit, focus: Option<Hit>) -> bool {
+        hit == Some(want) || focus == Some(want)
+    }
+
+    /// Ask a worker for a preview if it is neither decoded nor known broken.
+    fn want_thumb(&mut self, path: &Path) {
+        if self.thumbs.contains_key(path) {
+            return;
+        }
+        if let Some(at) = self.failed.get(path) {
+            if at.elapsed() < Duration::from_secs(10) {
+                return;
+            }
+        }
+        self.request_serial += 1;
+        let serial = self.request_serial;
+        let _ = self.requests.send((serial, path.to_path_buf()));
+    }
+
+    /// Collect finished previews without blocking.
+    fn collect_thumbs(&mut self) -> bool {
+        let mut changed = false;
+        while let Ok((_, thumb)) = self.results.try_recv() {
+            if thumb.image.is_some() {
+                self.failed.remove(&thumb.path);
+                self.thumbs.insert(thumb.path.clone(), thumb.image);
+            } else {
+                self.failed.insert(thumb.path.clone(), Instant::now());
+                self.thumbs.insert(thumb.path, None);
+            }
+            changed = true;
+        }
+        changed
+    }
+
+    fn thumb(&self, path: &Path) -> Option<&image::RgbaImage> {
+        self.thumbs.get(path).and_then(|t| t.as_ref())
+    }
+
     /// Draw the whole window. One function so a click and a repaint can never
     /// disagree about where a control is.
-    pub fn paint(&self, state: &State) -> Result<(), String> {
+    pub fn paint(&self, state: &State, focus: Option<Hit>) -> Result<(), String> {
         let l = layout(self.w, self.h);
         self.fill(
             self.palette.background,
@@ -439,29 +798,47 @@ impl App {
             },
         )?;
         self.label(PAD, PAD - 8, APP_NAME, self.palette.foreground, 20.0)?;
-        self.label(
-            PAD,
-            PAD + 22,
-            &format!("Theme: {}", theme_label(&state.status.theme)),
-            self.palette.muted,
-            12.0,
-        )?;
+        let theme_line = match state.screens().as_slice() {
+            [] => format!(
+                "Theme: {}   No screens reported",
+                theme_label(&state.status.theme)
+            ),
+            [one] => format!(
+                "Theme: {}   Screen: {}",
+                theme_label(&state.status.theme),
+                one
+            ),
+            many => format!(
+                "Theme: {}   {} screens",
+                theme_label(&state.status.theme),
+                many.len()
+            ),
+        };
+        self.label(PAD, PAD + 22, &theme_line, self.palette.muted, 12.0)?;
         // Tabs.
         for (rect, tab, text) in [
             (l.tabs.0, Tab::Official, "Official themes"),
             (l.tabs.1, Tab::Mine, "My wallpapers"),
         ] {
-            self.button(rect, text, state.tab == tab)?;
+            self.button(rect, text, state.tab == tab, true)?;
+        }
+        if state.multi_screen() {
+            // The screen choice only exists when there is more than one screen.
+            let targets = targets(state);
+            for (i, rect) in screen_rects(&l, targets.len()).iter().enumerate() {
+                let label = target_short(&targets[i]);
+                self.button(*rect, &label, state.target == targets[i], true)?;
+            }
         }
 
         // Tiles.
         let visible = state.visible();
         if visible.is_empty() {
             let text = match state.tab {
-                Tab::Official => "No theme wallpapers are installed.\nChoose a theme in NIRUX settings, or add an image under My wallpapers.",
-                Tab::Mine => "No images of your own. Put PNG files in ~/Pictures/Wallpapers and open this window again.",
+                Tab::Official => "No theme wallpapers are installed. Choose a theme in NIRUX settings, or add an image under My wallpapers.",
+                Tab::Mine => "No images of your own. Put PNG, JPEG, WebP or BMP files in ~/Pictures/Wallpapers and open this window again.",
             };
-            for (i, line) in text.lines().enumerate() {
+            for (i, line) in wrap(text, l.left.width as usize / 7).iter().enumerate() {
                 self.label(
                     l.left.x + 8,
                     l.left.y + 16 + i as i16 * 22,
@@ -482,7 +859,10 @@ impl App {
                 .map(|a| Path::new(a) == entry.path)
                 .unwrap_or(false);
             let chosen = state.pending.image.as_deref() == Some(entry.path.as_path());
-            let border = if chosen || active {
+            let hovered = focus == Some(Hit::Tile(i));
+            let border = if hovered {
+                self.palette.foreground
+            } else if chosen || active {
                 self.palette.accent
             } else {
                 self.palette.border
@@ -496,32 +876,21 @@ impl App {
                     ..rect
                 },
             )?;
-            // The preview is cached on disk keyed by the file's identity, so
-            // this is a file check on every repaint rather than a decode.
-            let thumb = thumbs::thumbnail(&entry.path);
-            match thumb {
-                Some(path) => {
-                    if let Ok(img) = image::open(&path) {
-                        let rgba = img.to_rgba8();
-                        let tw = rect.width.min(rgba.width() as u16);
-                        let th = rect.height.min(rgba.height() as u16).min(THUMB);
-                        let small = image::imageops::resize(
-                            &rgba,
-                            u32::from(tw),
-                            u32::from(th),
-                            image::imageops::FilterType::Triangle,
-                        );
-                        self.upload(rect.x, rect.y + 2, tw, th, small.as_raw())?;
-                    }
-                }
+            let inner = Rectangle {
+                x: rect.x + 2,
+                y: rect.y + 2,
+                width: rect.width - 4,
+                height: rect.height.saturating_sub(20),
+            };
+            match self.thumb(&entry.path) {
+                Some(image) => self.image_fill(inner, image)?,
                 None => {
-                    self.label(
-                        rect.x + 6,
-                        rect.y + 8,
-                        "(no preview)",
-                        self.palette.muted,
-                        11.0,
-                    )?;
+                    let text = if self.failed.contains_key(&entry.path) {
+                        "(no preview)"
+                    } else {
+                        "Loading preview"
+                    };
+                    self.label(rect.x + 6, rect.y + 8, text, self.palette.muted, 11.0)?;
                 }
             }
             let label = truncate(&entry.name, 18);
@@ -538,67 +907,18 @@ impl App {
             )?;
         }
 
-        // Panel.
-        self.fill(self.palette.surface, l.panel)?;
-        self.label(
-            l.panel.x + 12,
-            l.panel.y + 4,
-            "Scale",
-            self.palette.muted,
-            12.0,
-        )?;
-        let scale = state
-            .pending
-            .scale
-            .clone()
-            .unwrap_or_else(|| state.status.scale.clone());
-        for (i, rect) in scale_rects(&l).iter().enumerate() {
-            self.button(*rect, SCALES[i], SCALES[i] == scale)?;
+        self.paint_panel(state, &l, focus)?;
+
+        if let Some(hit) = focus {
+            if let Some(rect) = hit_rect(&l, hit, state) {
+                self.ring(rect)?;
+            }
         }
-        self.label(
-            l.panel.x + 12,
-            l.panel.y + 148,
-            "Rotate (minutes)",
-            self.palette.muted,
-            12.0,
-        )?;
-        let rotation = state
-            .pending
-            .rotation
-            .unwrap_or(state.status.rotation_minutes);
-        for (i, rect) in rotation_rects(&l).iter().enumerate() {
-            let text = if ROTATIONS[i] == 0 {
-                "Off".to_string()
-            } else {
-                ROTATIONS[i].to_string()
-            };
-            self.button(*rect, &text, ROTATIONS[i] == rotation)?;
-        }
-        let follow = state
-            .pending
-            .follow_theme
-            .unwrap_or(state.status.follow_theme);
-        self.button(
-            follow_rect(&l),
-            if follow {
-                "Follow theme: on"
-            } else {
-                "Follow theme: off"
-            },
-            follow,
-        )?;
-        self.label(
-            l.panel.x + 12,
-            l.panel.y + 290,
-            "A chosen image overrides the theme.",
-            self.palette.muted,
-            11.0,
-        )?;
-        self.button(apply_rect(&l), "Apply", !state.pending.is_empty())?;
-        self.button(cancel_rect(&l), "Discard", !state.pending.is_empty())?;
 
         // Footer message.
-        let message = if state.message.is_empty() {
+        let message = if state.busy {
+            "Applying… the window manager is applying the change".to_string()
+        } else if state.message.is_empty() {
             describe(state)
         } else {
             state.message.clone()
@@ -608,13 +928,169 @@ impl App {
         } else {
             self.palette.muted
         };
-        self.label(PAD, l.footer + 8, &truncate(&message, 96), colour, 12.0)?;
         self.label(
             PAD,
-            l.footer + 30,
-            "Tab/arrows select  Enter applies  Esc closes  q quits",
+            l.footer + 6,
+            &truncate(&message, (self.w as usize / 7).saturating_sub(2)),
+            colour,
+            12.0,
+        )?;
+        self.label(
+            PAD,
+            l.footer + 26,
+            "Tab move  arrows select  Space choose  Enter apply  Ctrl+D discard  F1 help  Esc/q close",
             self.palette.muted,
             11.0,
+        )?;
+        Ok(())
+    }
+
+    fn paint_panel(&self, state: &State, l: &Layout, focus: Option<Hit>) -> Result<(), String> {
+        self.fill(self.palette.surface, l.panel)?;
+        let x = l.panel.x + 12;
+        let target = state.target.label();
+        self.label(
+            x,
+            l.panel.y + 4,
+            &truncate(&format!("Settings for {target}"), 40),
+            self.palette.muted,
+            12.0,
+        )?;
+
+        let own = state
+            .active_screen_name()
+            .and_then(|name| state.status.override_for(name))
+            .is_some_and(|o| !o.inherits());
+        // The focus ring is drawn around the focused control, so the keyboard
+        // always shows what Space or Enter would act on.
+        self.button(
+            settings_rect(l),
+            if own {
+                "This screen follows the theme"
+            } else {
+                "This screen follows the shared settings"
+            },
+            own,
+            state.override_target() && state.override_target(),
+        )?;
+        let targets_set = state.override_target();
+        self.label(
+            x,
+            l.panel.y + 22,
+            if targets_set {
+                "Pick a picture below to give this screen its own"
+            } else {
+                "Pick a screen in the header to set it alone"
+            },
+            self.palette.muted,
+            10.0,
+        )?;
+
+        self.label(x, l.panel.y + 78, "Scale", self.palette.muted, 12.0)?;
+        let scale = state
+            .pending
+            .scale
+            .clone()
+            .unwrap_or_else(|| match state.target {
+                Target::All => state.status.scale.clone(),
+                Target::Screen(ref name) => state
+                    .screen_plan(name)
+                    .map(|s| s.scale.clone())
+                    .unwrap_or_else(|| state.status.scale.clone()),
+            });
+        for (i, rect) in scale_rects(l).iter().enumerate() {
+            let hit = Hit::Scale(i as u8);
+            self.button(*rect, SCALES[i], SCALES[i] == scale, !state.busy)?;
+            let _ = self.selected(Some(hit), hit, focus);
+        }
+        let effective = match &state.target {
+            Target::All => state.status.scale.clone(),
+            Target::Screen(name) => state
+                .screen_rendered(name)
+                .map(|r| r.scale.clone())
+                .filter(|s| !s.is_empty())
+                .or_else(|| state.screen_plan(name).map(|s| s.scale.clone()))
+                .unwrap_or_default(),
+        };
+        self.label(
+            x,
+            l.panel.y + 144,
+            &truncate(&format!("In effect: {effective}"), 38),
+            self.palette.muted,
+            11.0,
+        )?;
+
+        self.label(
+            x,
+            l.panel.y + 168,
+            "Rotate (minutes)",
+            self.palette.muted,
+            12.0,
+        )?;
+        let rotation = state
+            .pending
+            .rotation
+            .unwrap_or(state.status.rotation_minutes);
+        for (i, rect) in rotation_rects(l).iter().enumerate() {
+            let text = if ROTATIONS[i] == 0 {
+                "Off".to_string()
+            } else {
+                ROTATIONS[i].to_string()
+            };
+            self.button(*rect, &text, ROTATIONS[i] == rotation, !state.busy)?;
+        }
+        if !state.status.rotation_possible() {
+            self.label(
+                x,
+                l.panel.y + 224,
+                "A single picture ignores rotation.",
+                self.palette.muted,
+                11.0,
+            )?;
+        }
+
+        let follow = state
+            .pending
+            .follow_theme
+            .unwrap_or(state.status.follow_theme);
+        self.button(
+            follow_rect(l),
+            if follow {
+                "Follow theme: on"
+            } else {
+                "Follow theme: off"
+            },
+            follow,
+            !state.busy,
+        )?;
+
+        // What this target shows, and why.
+        let lines = describe_target(state, &state.target);
+        for (i, line) in lines.iter().enumerate() {
+            self.label(
+                x,
+                l.panel.y + 292 + i as i16 * 18,
+                &truncate(line, 42),
+                if i == 0 {
+                    self.palette.foreground
+                } else {
+                    self.palette.muted
+                },
+                11.0,
+            )?;
+        }
+
+        self.button(
+            apply_rect(l),
+            "Apply",
+            !state.pending.is_empty() && !state.busy,
+            !state.pending.is_empty() && !state.busy,
+        )?;
+        self.button(
+            cancel_rect(l),
+            "Discard",
+            !state.pending.is_empty() && !state.busy,
+            !state.pending.is_empty() && !state.busy,
         )?;
         Ok(())
     }
@@ -627,6 +1103,30 @@ impl App {
     }
 }
 
+/// Two workers are enough for a list of previews; more only competes for the
+/// same disk and decoder. Each one exits when the window drops the sender.
+fn spawn_workers(work: Receiver<(u64, PathBuf)>, done: Sender<(u64, Thumb)>) {
+    let work = Arc::new(Mutex::new(work));
+    for _ in 0..2 {
+        let work = work.clone();
+        let done = done.clone();
+        thread::spawn(move || {
+            let take = |work: &Arc<Mutex<Receiver<(u64, PathBuf)>>>| {
+                work.lock().ok().and_then(|rx| rx.recv().ok())
+            };
+            loop {
+                let Ok((serial, path)) = take(&work).ok_or(()) else {
+                    return;
+                };
+                let image = thumbs::decode_preview(&path);
+                if done.send((serial, Thumb { path, image })).is_err() {
+                    return;
+                }
+            }
+        });
+    }
+}
+
 /// Human name for a theme slug.
 pub fn theme_label(slug: &str) -> String {
     backend::THEMES
@@ -634,6 +1134,27 @@ pub fn theme_label(slug: &str) -> String {
         .find(|(s, _)| *s == slug)
         .map(|(_, label)| (*label).to_string())
         .unwrap_or_else(|| slug.trim_start_matches("niru-").to_string())
+}
+
+/// A short, readable name for a RandR output: `eDP-1` stays as it is.
+pub fn screen_label(name: &str) -> String {
+    name.to_string()
+}
+
+fn target_short(target: &Target) -> String {
+    match target {
+        Target::All => "All screens".to_string(),
+        Target::Screen(name) => truncate(name, 12),
+    }
+}
+
+/// The screen choices shown in the header: all screens first, then each one.
+pub fn targets(state: &State) -> Vec<Target> {
+    let mut out = vec![Target::All];
+    for name in state.screens() {
+        out.push(Target::Screen(name));
+    }
+    out
 }
 
 fn truncate(text: &str, max: usize) -> String {
@@ -645,26 +1166,127 @@ fn truncate(text: &str, max: usize) -> String {
     out
 }
 
-/// One line about what the desktop is showing.
-fn describe(state: &State) -> String {
-    if state.status.follows_theme() {
-        format!(
-            "Showing the {} theme wallpaper",
-            theme_label(&state.status.theme)
-        )
-    } else if state.status.shows_theme_colour() {
+/// Break a paragraph at word boundaries, roughly `width` characters per line.
+fn wrap(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(20);
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    for word in text.split_whitespace() {
+        if !line.is_empty() && line.chars().count() + word.chars().count() + 1 > width {
+            lines.push(std::mem::take(&mut line));
+        }
+        if !line.is_empty() {
+            line.push(' ');
+        }
+        line.push_str(word);
+    }
+    if !line.is_empty() {
+        lines.push(line);
+    }
+    lines
+}
+
+/// What one target shows, in up to three short lines.
+pub fn describe_target(state: &State, target: &Target) -> Vec<String> {
+    let status = &state.status;
+    if !status.enabled {
+        return vec![
+            "NIRUWM does not own the wallpaper.".into(),
+            "Enable it in the NIRUX configuration.".into(),
+        ];
+    }
+    match target {
+        Target::All => {
+            let mut out = vec![describe_common(state)];
+            if state.multi_screen() {
+                let inherited = status.screens.iter().filter(|s| !s.overrides()).count();
+                let own = status.screens.iter().filter(|s| s.overrides()).count();
+                out.push(format!(
+                    "{} screen(s) inherit this, {} have their own",
+                    inherited, own
+                ));
+            }
+            if status.has_failure() {
+                out.push("A screen failed to show its picture.".into());
+            }
+            out
+        }
+        Target::Screen(name) => {
+            let mut out = Vec::new();
+            if let Some(rendered) = state.screen_rendered(name) {
+                match rendered.kind.as_str() {
+                    "theme" => out.push(format!("Showing theme {}", file_name(&rendered.image))),
+                    "image" => out.push(format!("Showing {}", file_name(&rendered.image))),
+                    "colour" => out.push("Theme colour, no theme picture".into()),
+                    "failed" => {
+                        out.push(format!("Could not set: {}", truncate(&rendered.note, 30)))
+                    }
+                    "off" => out.push("Not set: NIRUWM does not own it".into()),
+                    _ => out.push("Not reported by the window manager".into()),
+                }
+            } else if let Some(plan) = state.screen_plan(name) {
+                out.push(match plan.kind.as_str() {
+                    "theme" => format!("Configured: theme {}", file_name(&plan.image)),
+                    "image" => format!("Configured: {}", file_name(&plan.image)),
+                    "colour" => "Configured: theme colour".into(),
+                    _ => "Configured: nothing".into(),
+                });
+                out.push("No running window manager to confirm".into());
+            } else {
+                out.push("Screen not reported".into());
+            }
+            if let Some(entry) = status.override_for(name) {
+                if entry.inherits() {
+                    out.push("Inherits the shared settings".into());
+                } else {
+                    out.push(match entry.mode.as_str() {
+                        "theme" => "Own setting: follows the theme".into(),
+                        _ if !entry.file.is_empty() => {
+                            format!("Own setting: {}", file_name(&entry.file))
+                        }
+                        _ => "Own setting".into(),
+                    });
+                }
+            } else {
+                out.push("Inherits the shared settings".into());
+            }
+            out
+        }
+    }
+}
+
+/// One line about what the desktop is showing on the inheriting screens.
+fn describe_common(state: &State) -> String {
+    let status = &state.status;
+    if status.follows_theme() {
+        format!("Showing the {} theme wallpaper", theme_label(&status.theme))
+    } else if status.shows_theme_colour() {
         format!(
             "The {} theme has no wallpaper; its background colour is used",
-            theme_label(&state.status.theme)
+            theme_label(&status.theme)
         )
-    } else if state.status.has_override() {
-        format!("Showing your image: {}", file_name(&state.status.file))
+    } else if status.has_override() {
+        format!("Showing your image: {}", file_name(&status.file))
+    } else if status.mode == "fixed" && !status.file.is_empty() {
+        format!("Keeping {}", file_name(&status.file))
     } else {
-        "No wallpaper is set".to_string()
+        "No picture chosen yet".to_string()
+    }
+}
+
+/// One line about what the desktop is showing.
+fn describe(state: &State) -> String {
+    if state.status.enabled {
+        describe_common(state)
+    } else {
+        "NIRUWM does not own the wallpaper".to_string()
     }
 }
 
 fn file_name(path: &str) -> String {
+    if path.is_empty() {
+        return "nothing".into();
+    }
     Path::new(path)
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
@@ -675,10 +1297,13 @@ fn file_name(path: &str) -> String {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Hit {
     Tab(Tab),
+    /// The screen choice at this position.
+    Screen(u8),
     Tile(usize),
     Scale(u8),
     Rotation(u8),
     FollowTheme,
+    ScreenFollow,
     Apply,
     Cancel,
 }
@@ -691,28 +1316,30 @@ pub struct Layout {
     pub tiles_per_row: usize,
     pub visible_rows: usize,
     pub tabs: (Rectangle, Rectangle),
+    /// The y of the header tabs, and of the screen choice beneath them.
+    pub screen_row: i16,
 }
 
 pub fn layout(w: u16, h: u16) -> Layout {
-    let w = i16::try_from(w).unwrap_or(960);
-    let h = i16::try_from(h).unwrap_or(640);
+    let w = i16::try_from(w).unwrap_or(1000);
+    let h = i16::try_from(h).unwrap_or(690);
     let list_w = w - PAD * 3 - PANEL_W;
-    let top = HEADER + ROW * 2;
+    let top = HEADER + ROW;
     let footer = h - FOOTER;
     let tiles_per_row = ((list_w / TILE_W).max(1)) as usize;
     let visible_rows = ((footer - top) / TILE_H).max(1) as usize;
     Layout {
         left: Rectangle {
             x: PAD,
-            y: HEADER,
+            y: top,
             width: (list_w + PAD).max(1) as u16,
-            height: (footer - HEADER).max(1) as u16,
+            height: (footer - top).max(1) as u16,
         },
         panel: Rectangle {
             x: w - PAD - PANEL_W,
-            y: HEADER,
+            y: HEADER - 20,
             width: PANEL_W as u16,
-            height: (footer - HEADER).max(1) as u16,
+            height: (footer - HEADER + 20).max(1) as u16,
         },
         footer,
         tiles_per_row,
@@ -720,18 +1347,35 @@ pub fn layout(w: u16, h: u16) -> Layout {
         tabs: (
             Rectangle {
                 x: PAD,
-                y: HEADER - 46,
+                y: 66,
                 width: 130,
-                height: 30,
+                height: 28,
             },
             Rectangle {
                 x: PAD + 140,
-                y: HEADER - 46,
+                y: 66,
                 width: 130,
-                height: 30,
+                height: 28,
             },
         ),
+        screen_row: 66,
     }
+}
+
+/// The rectangle a control occupies, for the focus ring and for keys.
+pub fn hit_rect(l: &Layout, hit: Hit, state: &State) -> Option<Rectangle> {
+    Some(match hit {
+        Hit::Tab(Tab::Official) => l.tabs.0,
+        Hit::Tab(Tab::Mine) => l.tabs.1,
+        Hit::Screen(i) => *screen_rects(l, targets(state).len()).get(i as usize)?,
+        Hit::Tile(i) => tile_rect(l, i, state.scroll),
+        Hit::Scale(i) => *scale_rects(l).get(i as usize)?,
+        Hit::Rotation(i) => *rotation_rects(l).get(i as usize)?,
+        Hit::FollowTheme => follow_rect(l),
+        Hit::ScreenFollow => settings_rect(l),
+        Hit::Apply => apply_rect(l),
+        Hit::Cancel => cancel_rect(l),
+    })
 }
 
 /// The clickable region at a point, if any.
@@ -743,6 +1387,14 @@ pub fn hit(w: u16, h: u16, x: i16, y: i16, state: &State) -> Option<Hit> {
     ] {
         if inside(rect, x, y) {
             return Some(hit);
+        }
+    }
+    if state.multi_screen() {
+        let targets = targets(state);
+        for (i, rect) in screen_rects(&l, targets.len()).iter().enumerate() {
+            if inside(*rect, x, y) {
+                return Some(Hit::Screen(i as u8));
+            }
         }
     }
     // Tiles, in the order they are painted.
@@ -768,6 +1420,9 @@ pub fn hit(w: u16, h: u16, x: i16, y: i16, state: &State) -> Option<Hit> {
     if inside(follow_rect(&l), x, y) {
         return Some(Hit::FollowTheme);
     }
+    if inside(settings_rect(&l), x, y) {
+        return Some(Hit::ScreenFollow);
+    }
     if inside(apply_rect(&l), x, y) {
         return Some(Hit::Apply);
     }
@@ -775,6 +1430,22 @@ pub fn hit(w: u16, h: u16, x: i16, y: i16, state: &State) -> Option<Hit> {
         return Some(Hit::Cancel);
     }
     None
+}
+
+fn screen_rects(l: &Layout, count: usize) -> Vec<Rectangle> {
+    let mut out = Vec::new();
+    let mut x = l.tabs.1.x + l.tabs.1.width as i16 + 20;
+    for i in 0..count {
+        let width = if i == 0 { 100 } else { 92 };
+        out.push(Rectangle {
+            x,
+            y: l.screen_row,
+            width,
+            height: 28,
+        });
+        x += width as i16 + 6;
+    }
+    out
 }
 
 fn inside(r: Rectangle, x: i16, y: i16) -> bool {
@@ -805,12 +1476,12 @@ const ROTATIONS: [u32; 5] = [0, 5, 10, 30, 60];
 
 fn scale_rects(l: &Layout) -> Vec<Rectangle> {
     let mut out = Vec::new();
-    let y = l.panel.y + 74;
+    let y = l.panel.y + 96;
     for i in 0..SCALES.len() {
         out.push(Rectangle {
-            x: l.panel.x + 12 + (i as i16 % 2) * 112,
-            y: y + (i as i16 / 2) * 32,
-            width: 106,
+            x: l.panel.x + 12 + (i as i16 % 2) * 138,
+            y: y + (i as i16 / 2) * 30,
+            width: 130,
             height: 26,
         });
     }
@@ -819,12 +1490,12 @@ fn scale_rects(l: &Layout) -> Vec<Rectangle> {
 
 fn rotation_rects(l: &Layout) -> Vec<Rectangle> {
     let mut out = Vec::new();
-    let y = l.panel.y + 178;
+    let y = l.panel.y + 186;
     for i in 0..ROTATIONS.len() {
         out.push(Rectangle {
-            x: l.panel.x + 12 + (i as i16 % 3) * 76,
-            y: y + (i as i16 / 3) * 30,
-            width: 70,
+            x: l.panel.x + 12 + (i as i16 % 3) * 92,
+            y: y + (i as i16 / 3) * 28,
+            width: 86,
             height: 24,
         });
     }
@@ -834,9 +1505,18 @@ fn rotation_rects(l: &Layout) -> Vec<Rectangle> {
 fn follow_rect(l: &Layout) -> Rectangle {
     Rectangle {
         x: l.panel.x + 12,
-        y: l.panel.y + 248,
+        y: l.panel.y + 250,
         width: PANEL_W as u16 - 24,
-        height: 30,
+        height: 28,
+    }
+}
+
+fn settings_rect(l: &Layout) -> Rectangle {
+    Rectangle {
+        x: l.panel.x + 12,
+        y: l.panel.y + 40,
+        width: PANEL_W as u16 - 24,
+        height: 28,
     }
 }
 
@@ -858,48 +1538,122 @@ fn cancel_rect(l: &Layout) -> Rectangle {
     }
 }
 
-/// Apply the staged changes, one `niructl` call per setting.
-///
-/// Kept separate from the event loop so a test can drive it without a window.
-pub fn apply(state: &mut State) -> Result<(), String> {
-    let pending = state.pending.clone();
+/// Stage the currently selected image for the current target.
+pub fn select_current(state: &mut State) {
+    let picked = state
+        .current()
+        .map(|entry| (entry.name.clone(), entry.path.clone()));
+    if let Some((name, path)) = picked {
+        state.pending.image = Some(path);
+        // An explicit picture is what a screen shows instead of the theme, so
+        // leaving theme following staged would contradict it.
+        if state
+            .pending
+            .follow_theme
+            .unwrap_or(state.status.follow_theme)
+        {
+            state.pending.follow_theme = Some(false);
+            state.set_message(
+                format!("Stage {name} — this replaces the theme wallpaper"),
+                false,
+            );
+        } else {
+            state.set_message(format!("Staged {name}"), false);
+        }
+    }
+}
+
+/// Build the change the staged settings describe for the current target.
+pub fn staged_change(state: &State) -> Result<Change, String> {
+    let pending = &state.pending;
     if pending.is_empty() {
+        return Ok(Change::default());
+    }
+    if pending.image.is_some() && pending.follow_theme == Some(true) {
+        return Err("choose either a picture or the theme wallpaper, not both".into());
+    }
+    let mut change = Change::default();
+    match &state.target {
+        Target::All => {
+            change.image = pending.image.as_ref().map(|p| p.display().to_string());
+            change.scale = pending.scale.clone();
+            change.rotation = pending.rotation;
+            change.follow_theme = pending.follow_theme;
+        }
+        Target::Screen(name) => {
+            // A screen gets its own picture or follows the theme. Scale and
+            // inheritance are its own too; rotation stays a common setting
+            // because one desktop rotates together.
+            if pending.inherit {
+                change.output_inherit = Some(name.clone());
+                change.rotation = pending.rotation;
+            }
+            if let Some(image) = &pending.image {
+                change.output_image = Some((name.clone(), image.display().to_string()));
+            } else if pending.follow_theme == Some(true) {
+                change.output_image = None;
+                // Mode `theme` is expressed by dropping a picture and keeping
+                // an entry that follows the theme.
+                change.output_inherit = change.output_inherit.or_else(|| Some(name.clone()));
+            }
+            if let Some(scale) = &pending.scale {
+                change.output_scale = Some((name.clone(), scale.clone()));
+            }
+        }
+    }
+    Ok(change)
+}
+
+/// Apply the staged changes as one transaction and take the desktop's answer.
+///
+/// Kept separate from the event loop so a test can drive it without a window:
+/// the `command` argument is what really runs it.
+pub fn apply_with<F>(state: &mut State, command: F) -> Result<(), String>
+where
+    F: FnOnce(&Change) -> Result<(), String>,
+{
+    let change = staged_change(state)?;
+    if change.is_empty() {
         return Ok(());
     }
-    // The two workflows never run together: an image that replaces the theme
-    // and theme following that replaces the image would contradict each other,
-    // and the backend's last command would silently win. Refuse the
-    // combination rather than picking one.
-    if pending.image.is_some() && pending.follow_theme == Some(true) {
-        return Err("choose either your own image or the theme wallpaper, not both".into());
-    }
-    // Order matters: choosing an image sets mode=single, and turning theme
-    // following on resets that override, so the image goes first.
-    if let Some(image) = &pending.image {
-        backend::set_image(&image.display().to_string())?;
-    }
-    if let Some(scale) = &pending.scale {
-        backend::set_scale(scale)?;
-    }
-    if let Some(rotation) = pending.rotation {
-        backend::set_rotation(rotation)?;
-    }
-    if let Some(follow) = pending.follow_theme {
-        backend::set_follow_theme(follow)?;
-        // Turning theme following on while an image is still the single
-        // override leaves `single` behind; the backend handles that, and this
-        // keeps the reported state honest if it did not.
-    }
-    let status = backend::read_status()?;
-    let list = backend::read_list(&status.theme_dir)?;
+    command(&change)?;
+    let (status, list) = fetch()?;
+    let target = state.target.clone();
     state.status = status;
     state.list = list;
     state.pending = Pending::default();
+    state.seen = snapshot(&state.status, &state.list);
+    if let Target::Screen(name) = &target {
+        if !state.screens().iter().any(|s| s == name) {
+            state.target = Target::All;
+        }
+    }
     if state.selected >= state.visible().len() {
         state.selected = state.visible().len().saturating_sub(1);
     }
-    state.set_message("Applied", false);
+    let failure = state
+        .status
+        .rendered
+        .iter()
+        .find(|r| r.failed())
+        .map(|r| format!("Applied, but {} failed: {}", r.output, r.note))
+        .or_else(|| {
+            if state.status.enabled && !state.status.has_rendered() {
+                Some("Saved. No running window manager confirmed the result.".into())
+            } else {
+                None
+            }
+        });
+    match failure {
+        Some(text) => state.set_message(text, true),
+        None => state.set_message("Applied", false),
+    }
     Ok(())
+}
+
+/// The real transaction: one `niructl wallpaper apply`.
+pub fn apply(state: &mut State) -> Result<(), String> {
+    apply_with(state, backend::apply_change)
 }
 
 /// Keysyms for the keys the window answers to.
@@ -920,6 +1674,9 @@ const K_H: u32 = b'h' as u32;
 const K_J: u32 = b'j' as u32;
 const K_K: u32 = b'k' as u32;
 const K_L: u32 = b'l' as u32;
+const K_A: u32 = b'a' as u32;
+const K_D: u32 = b'd' as u32;
+const K_F1: u32 = 0xffbe;
 
 /// Keycode-to-keysym table for the connected keyboard.
 ///
@@ -962,56 +1719,108 @@ impl Keys {
     }
 }
 
-/// The keyboard controls the window answers to.
-pub fn handle_key(state: &mut State, key: u32, l: &Layout) -> KeyAction {
-    match key {
-        K_ESCAPE => KeyAction::Quit,
-        K_Q | K_Q_SHIFTED => KeyAction::Quit,
-        K_RETURN => KeyAction::Apply,
-        K_TAB => {
-            state.tab = match state.tab {
-                Tab::Official => Tab::Mine,
-                Tab::Mine => Tab::Official,
-            };
-            state.selected = 0;
-            state.scroll = 0;
-            KeyAction::Redraw
+/// The order Tab moves through, so every control is keyboard reachable.
+pub fn focus_order(state: &State) -> Vec<Hit> {
+    let mut out = vec![Hit::Tab(Tab::Official), Hit::Tab(Tab::Mine)];
+    if state.multi_screen() {
+        for i in 0..targets(state).len() {
+            out.push(Hit::Screen(i as u8));
         }
-        K_RIGHT | K_L => {
-            let count = state.visible().len();
-            if count > 0 {
-                state.selected = (state.selected + 1).min(count - 1);
-                ensure_visible(state, l);
-            }
-            KeyAction::Redraw
-        }
-        K_LEFT | K_H => {
-            state.selected = state.selected.saturating_sub(1);
-            ensure_visible(state, l);
-            KeyAction::Redraw
-        }
-        K_DOWN | K_J => {
-            let count = state.visible().len();
-            state.selected = (state.selected + l.tiles_per_row).min(count.saturating_sub(1));
-            ensure_visible(state, l);
-            KeyAction::Redraw
-        }
-        K_UP | K_K => {
-            state.selected = state.selected.saturating_sub(l.tiles_per_row);
-            ensure_visible(state, l);
-            KeyAction::Redraw
-        }
-        K_SPACE => KeyAction::Select,
-        _ => KeyAction::None,
     }
+    if !state.visible().is_empty() {
+        out.push(Hit::Tile(0));
+    }
+    for i in 0..SCALES.len() {
+        out.push(Hit::Scale(i as u8));
+    }
+    for i in 0..ROTATIONS.len() {
+        out.push(Hit::Rotation(i as u8));
+    }
+    out.push(Hit::FollowTheme);
+    out.push(Hit::ScreenFollow);
+    out.push(Hit::Apply);
+    out.push(Hit::Cancel);
+    out
 }
 
+/// Move keyboard focus forward or backward in `focus_order`.
+pub fn move_focus(state: &State, focus: Option<Hit>, forward: bool) -> Option<Hit> {
+    let order = focus_order(state);
+    if order.is_empty() {
+        return None;
+    }
+    let current = focus.and_then(|f| order.iter().position(|h| *h == f));
+    let next = match (current, forward) {
+        (Some(i), true) => (i + 1) % order.len(),
+        (Some(i), false) => (i + order.len() - 1) % order.len(),
+        (None, true) => 0,
+        (None, false) => order.len() - 1,
+    };
+    Some(order[next])
+}
+
+/// The keyboard controls the window answers to.
 pub enum KeyAction {
     None,
     Redraw,
     Select,
     Apply,
+    Discard,
     Quit,
+    /// Enter on a focused control, the same as clicking it.
+    Activate(Hit),
+    /// Start at the first control, or move back to the grid.
+    Focus(Option<Hit>),
+    Help,
+}
+
+pub fn handle_key(state: &mut State, key: u32, _l: &Layout, focus: Option<Hit>) -> KeyAction {
+    match key {
+        K_ESCAPE => KeyAction::Quit,
+        K_Q | K_Q_SHIFTED => KeyAction::Quit,
+        K_F1 => KeyAction::Help,
+        K_TAB => KeyAction::Focus(move_focus(state, focus, true)),
+        K_D => {
+            if state.has_pending() && focus.is_none() {
+                KeyAction::Discard
+            } else {
+                KeyAction::Focus(move_focus(state, focus, false))
+            }
+        }
+        K_A => KeyAction::Focus(None),
+        K_RETURN => match focus {
+            Some(control) => KeyAction::Activate(control),
+            None => KeyAction::Apply,
+        },
+        K_SPACE => match focus {
+            Some(control) => KeyAction::Activate(control),
+            None => KeyAction::Select,
+        },
+        K_RIGHT | K_L => {
+            let count = state.visible().len();
+            if count > 0 {
+                state.selected = (state.selected + 1).min(count - 1);
+                ensure_visible(state, _l);
+            }
+            KeyAction::Redraw
+        }
+        K_LEFT | K_H => {
+            state.selected = state.selected.saturating_sub(1);
+            ensure_visible(state, _l);
+            KeyAction::Redraw
+        }
+        K_DOWN | K_J => {
+            let count = state.visible().len();
+            let l = _l;
+            state.selected = (state.selected + l.tiles_per_row).min(count.saturating_sub(1));
+            KeyAction::Redraw
+        }
+        K_UP | K_K => {
+            state.selected = state.selected.saturating_sub(_l.tiles_per_row);
+            KeyAction::Redraw
+        }
+        _ => KeyAction::None,
+    }
 }
 
 /// Scroll so the selected tile is on screen.
@@ -1024,226 +1833,384 @@ fn ensure_visible(state: &mut State, l: &Layout) {
     }
 }
 
-/// Stage the currently selected image.
-pub fn select_current(state: &mut State) {
-    let picked = state
-        .current()
-        .map(|entry| (entry.name.clone(), entry.path.clone()));
-    if let Some((name, path)) = picked {
-        state.pending.image = Some(path);
-        // The two workflows are exclusive. Staging an image while theme
-        // following is on would leave the user with a choice they cannot
-        // predict: `wallpaper set` writes mode=single, which stops the theme
-        // wallpaper from showing anyway. Say so instead of mixing states.
-        if state
-            .pending
-            .follow_theme
-            .unwrap_or(state.status.follow_theme)
-        {
-            state.pending.follow_theme = Some(false);
-            state.set_message(
-                format!("Stage {name} — this replaces the theme wallpaper"),
-                false,
-            );
-        } else {
-            state.set_message(format!("Stage {name}"), false);
-        }
-    }
+/// The help text shown by F1, as lines.
+pub fn help_lines() -> Vec<&'static str> {
+    vec![
+        "Tab / Shift+Tab     move between every control",
+        "Arrows             choose a picture in the grid",
+        "Space              choose the picture or press the focused control",
+        "Enter              apply, or press the focused control",
+        "Ctrl+D             discard the staged changes",
+        "A                  return to the picture grid",
+        "F1                 show or hide this help",
+        "Esc or q           close the window",
+        "A screen name      limits every change to that screen",
+        "All screens        changes the picture every screen inherits",
+    ]
 }
 
 /// The event loop. Returns when the window is closed.
 pub fn run(app: &mut App, state: &mut State, _palette: Palette) -> Result<(), String> {
-    app.paint(state)?;
-    app.flush()?;
+    // The window's own RandR list decides which screens exist, so the two
+    // never disagree about a screen that was plugged in a moment ago.
+    sync_screens(app, state);
+    let mut focus: Option<Hit> = None;
+    let mut help = false;
+    let mut dirty = true;
+    request_visible_previews(app, state);
     loop {
-        let event = app.c.wait_for_event().map_err(|e| e.to_string())?;
-        let mut redraw = true;
-        match event {
-            Event::Expose(e) if e.count == 0 => {}
-            Event::ConfigureNotify(e) => {
-                if e.width != app.w || e.height != app.h {
-                    app.w = e.width.max(MIN_WIDTH);
-                    app.h = e.height.max(MIN_HEIGHT);
-                    app.resize_backing()?;
-                }
+        let mut handled = false;
+        while let Some(event) = app.c.poll_for_event().map_err(|e| e.to_string())? {
+            handled = true;
+            dirty = true;
+            let came_from_user = matches!(
+                event,
+                Event::KeyPress(_) | Event::ButtonPress(_) | Event::MotionNotify(_)
+            );
+            if came_from_user {
+                app.last_activity = Instant::now();
             }
-            Event::KeyPress(e) => {
-                let l = layout(app.w, app.h);
-                match handle_key(state, app.keys.sym(e.detail), &l) {
-                    KeyAction::Quit => return Ok(()),
-                    KeyAction::Apply => {
-                        if let Err(err) = apply(state) {
-                            state.set_message(err, true);
-                        }
+            match event {
+                Event::Expose(e) if e.count == 0 => {}
+                Event::ConfigureNotify(e) => {
+                    if e.width != app.w || e.height != app.h {
+                        app.w = e.width.max(MIN_WIDTH);
+                        app.h = e.height.max(MIN_HEIGHT);
+                        app.resize_backing()?;
                     }
-                    KeyAction::Select => select_current(state),
-                    KeyAction::Redraw | KeyAction::None => {}
                 }
-            }
-            Event::ButtonPress(e) => {
-                redraw = handle_click(app, state, &e)?;
-                if !redraw {
-                    return Ok(());
+                Event::KeyPress(e) => {
+                    let l = layout(app.w, app.h);
+                    let key = app.keys.sym(e.detail);
+                    // Ctrl+D discards; plain D moves focus back. Neither
+                    // shadows the plain letters people already use here.
+                    let ctrl = e.state.contains(KeyButMask::CONTROL);
+                    if ctrl && key == K_D {
+                        state.pending = Pending::default();
+                        state.set_message("Discarded staged changes", false);
+                        focus = None;
+                        help = false;
+                        continue;
+                    }
+                    if help {
+                        help = false;
+                        focus = None;
+                        continue;
+                    }
+                    if e.state.contains(KeyButMask::SHIFT) && key == K_TAB {
+                        focus = move_focus(state, focus, false);
+                        continue;
+                    }
+                    match handle_key(state, key, &l, focus) {
+                        KeyAction::Quit => return Ok(()),
+                        KeyAction::Apply => {
+                            run_apply(app, state, focus)?;
+                            focus = None;
+                        }
+                        KeyAction::Select => select_current(state),
+                        KeyAction::Discard => {
+                            state.pending = Pending::default();
+                            state.set_message("Discarded staged changes", false);
+                        }
+                        KeyAction::Activate(Hit::Apply) => {
+                            run_apply(app, state, focus)?;
+                            focus = None;
+                        }
+                        KeyAction::Activate(control) => activate(state, control),
+                        KeyAction::Focus(next) => focus = next,
+                        KeyAction::Help => {
+                            help = true;
+                            focus = None;
+                        }
+                        KeyAction::Redraw | KeyAction::None => {}
+                    }
                 }
-            }
-            Event::ClientMessage(e) => {
-                if e.type_ == atom_id(&app.atoms, "WM_PROTOCOLS") {
-                    return Ok(());
+                Event::ButtonPress(e) => {
+                    match hit(app.w, app.h, e.event_x, e.event_y, state) {
+                        Some(Hit::Tile(i)) => {
+                            state.selected = i;
+                            select_current(state);
+                            focus = None;
+                        }
+                        Some(Hit::Apply) => {
+                            run_apply(app, state, None)?;
+                            focus = None;
+                        }
+                        Some(Hit::Cancel) => {
+                            activate(state, Hit::Cancel);
+                            focus = None;
+                        }
+                        Some(control) => {
+                            // A click on a setting changes it once, the same
+                            // as pressing Space on it.
+                            activate(state, control);
+                            focus = None;
+                        }
+                        None => {}
+                    }
                 }
+                Event::ClientMessage(e) => {
+                    if e.type_ == atom_id(&app.atoms, "WM_PROTOCOLS") {
+                        return Ok(());
+                    }
+                }
+                Event::RandrScreenChangeNotify(_) => {
+                    app.screens_dirty = true;
+                }
+                _ => dirty = false,
             }
-            _ => redraw = false,
         }
-        if redraw {
-            app.paint(state)?;
+        if app.collect_thumbs() {
+            dirty = true;
+        }
+        if app.screens_dirty || app.reread_screens() {
+            app.screens_dirty = false;
+            app.last_activity = Instant::now();
+            if let Err(err) = refresh(state) {
+                state.set_message(err, true);
+            }
+            dirty = true;
+        } else if !handled && app.last_activity.elapsed() >= REFRESH {
+            app.last_activity = Instant::now();
+            if app.reread_screens() {
+                sync_screens(app, state);
+            }
+            if let Err(err) = refresh(state) {
+                state.set_message(err, true);
+            }
+            dirty = true;
+        }
+        if dirty {
+            app.palette = state.palette;
+            if help {
+                paint_help(app)?;
+            } else {
+                app.paint(state, focus)?;
+            }
             app.flush()?;
+            dirty = false;
         } else {
             app.c.flush().map_err(|e| e.to_string())?;
+        }
+        request_visible_previews(app, state);
+        if !handled {
+            wait_for_input(app)?;
         }
     }
 }
 
-/// Returns whether to quit.
-fn handle_click(app: &App, state: &mut State, e: &ButtonPressEvent) -> Result<bool, String> {
-    match hit(app.w, app.h, e.event_x, e.event_y, state) {
-        Some(Hit::Tab(tab)) => {
+/// Add or remove the screens the window knows about in the desktop state.
+///
+/// A screen that disappeared is dropped from the plan and the selection falls
+/// back to all screens; its saved settings stay in the file for a reconnect.
+pub fn sync_screens(app: &App, state: &mut State) {
+    sync_screen_names(app.screens.iter().map(|s| s.name.clone()), state);
+}
+
+/// The same, from names alone, so a test needs no X connection.
+pub fn sync_screen_names(names: impl IntoIterator<Item = String>, state: &mut State) {
+    let names: Vec<String> = names.into_iter().collect();
+    let mut plan = Vec::new();
+    for name in &names {
+        if let Some(existing) = state.status.screens.iter().find(|s| &s.output == name) {
+            plan.push(existing.clone());
+            continue;
+        }
+        // A fresh screen inherits the common settings until it is set.
+        let overs = state.status.override_for(name).cloned();
+        plan.push(backend::ScreenPlan {
+            output: name.clone(),
+            source: if overs.as_ref().is_some_and(|o| !o.inherits()) {
+                "override".into()
+            } else {
+                "inherit".into()
+            },
+            kind: state.status.mode.clone(),
+            scale: state
+                .status
+                .override_for(name)
+                .map(|o| o.scale.clone())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| state.status.scale.clone()),
+            image: String::new(),
+        });
+    }
+    state.status.screens = plan;
+    let gone = match &state.target {
+        Target::Screen(name) if !names.contains(name) => Some(name.clone()),
+        _ => None,
+    };
+    if let Some(name) = gone {
+        state.target = Target::All;
+        state.pending = Pending::default();
+        state.set_message(
+            format!("{name} is no longer connected; settings now apply to all screens"),
+            false,
+        );
+    }
+}
+
+/// Block until the server has something to say or the refresh is due.
+///
+/// The connection is owned by this thread, so the window waits on its socket
+/// rather than spinning: a keypress wakes it immediately, and a theme change
+/// made elsewhere is noticed on the next refresh.
+fn wait_for_input(app: &App) -> Result<(), String> {
+    use std::os::unix::io::AsRawFd;
+    let fd = app.c.stream().as_raw_fd();
+    let remaining = REFRESH
+        .checked_sub(app.last_activity.elapsed())
+        .unwrap_or(Duration::from_millis(20))
+        .max(Duration::from_millis(20));
+    let mut poll = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let ms = remaining.as_millis().min(i32::MAX as u128) as i32;
+    // SAFETY: one pollfd describing the live X socket is passed.
+    let _ = unsafe { libc::poll(&mut poll, 1, ms) };
+    Ok(())
+}
+
+/// Show "applying", run the transaction, and leave the result in the footer.
+fn run_apply(app: &mut App, state: &mut State, focus: Option<Hit>) -> Result<(), String> {
+    if state.busy {
+        return Ok(());
+    }
+    state.busy = true;
+    app.paint(state, focus)?;
+    app.flush()?;
+    let result = apply(state);
+    state.busy = false;
+    if let Err(err) = result {
+        state.set_message(err, true);
+    }
+    app.paint(state, focus)?;
+    app.flush()?;
+    Ok(())
+}
+
+/// Activating a control changes the staged settings. Apply is handled by the
+/// caller, which runs the transaction.
+fn activate(state: &mut State, control: Hit) {
+    match control {
+        Hit::Tab(tab) => {
             state.tab = tab;
             state.selected = 0;
             state.scroll = 0;
         }
-        Some(Hit::Tile(i)) => {
-            state.selected = i;
-            select_current(state);
+        Hit::Screen(i) => {
+            let targets = targets(state);
+            if let Some(target) = targets.get(i as usize) {
+                if state.target != *target {
+                    state.target = target.clone();
+                    state.pending = Pending::default();
+                }
+            }
         }
-        Some(Hit::Scale(i)) => {
+        Hit::Tile(i) => {
+            if i < state.visible().len() {
+                state.selected = i;
+                select_current(state);
+            }
+        }
+        Hit::Scale(i) => {
             state.pending.scale = Some(SCALES[i as usize].to_string());
         }
-        Some(Hit::Rotation(i)) => {
-            state.pending.rotation = Some(ROTATIONS[i as usize]);
+        Hit::Rotation(i) => {
+            if state.status.rotation_possible() {
+                state.pending.rotation = Some(ROTATIONS[i as usize]);
+            } else {
+                state.set_message(
+                    "A single picture keeps one image; rotation would not take effect",
+                    true,
+                );
+            }
         }
-        Some(Hit::FollowTheme) => {
+        Hit::FollowTheme => {
             let now = state
                 .pending
                 .follow_theme
                 .unwrap_or(state.status.follow_theme);
             state.pending.follow_theme = Some(!now);
-            // Turning following on is the "use the theme's own wallpaper"
-            // workflow, so a staged image would contradict it.
             if !now {
                 state.pending.image = None;
+                state.pending.inherit = false;
                 state.set_message("Follow the theme wallpaper", false);
             } else {
-                state.set_message("Use a chosen image instead", false);
+                state.set_message("Use a chosen picture instead", false);
             }
         }
-        Some(Hit::Apply) => {
-            if let Err(err) = apply(state) {
-                state.set_message(err, true);
+        Hit::ScreenFollow => {
+            if !state.override_target() {
+                state.set_message(
+                    if state.status.follow_theme {
+                        "All screens already follow the theme"
+                    } else {
+                        "Turn on Follow theme for every screen"
+                    },
+                    false,
+                );
+                return;
             }
+            state.pending.inherit = true;
+            state.pending.image = None;
+            state.pending.scale = None;
+            state.set_message("Stage: follow the shared settings", false);
         }
-        Some(Hit::Cancel) => {
+        Hit::Apply => {}
+        Hit::Cancel => {
             state.pending = Pending::default();
-            state.set_message("Discarded pending changes", false);
+            state.set_message("Discarded staged changes", false);
         }
-        None => {}
     }
-    Ok(true)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn state() -> State {
-        State {
-            status: Status::default(),
-            list: vec![],
-            tab: Tab::Official,
-            selected: 0,
-            scroll: 0,
-            pending: Pending::default(),
-            message: String::new(),
-            message_is_error: false,
-        }
+/// Ask the workers for the previews of the tiles that are on screen.
+fn request_visible_previews(app: &mut App, state: &State) {
+    let l = layout(app.w, app.h);
+    let first = state.scroll * l.tiles_per_row;
+    let last = first + l.tiles_per_row * l.visible_rows;
+    let paths: Vec<PathBuf> = state
+        .visible()
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i >= first && *i < last)
+        .map(|(_, entry)| entry.path.clone())
+        .collect();
+    for path in paths {
+        app.want_thumb(&path);
     }
+}
 
-    #[test]
-    fn tiles_fit_the_list_width() {
-        let l = layout(960, 640);
-        assert!(l.tiles_per_row >= 3, "{} tiles per row", l.tiles_per_row);
-        let right = l.left.x + l.tiles_per_row as i16 * TILE_W;
-        assert!(right <= l.panel.x, "tiles overlap the panel");
+/// The help view: the same window, the controls on screen.
+fn paint_help(app: &App) -> Result<(), String> {
+    app.fill(
+        app.palette.background,
+        Rectangle {
+            x: 0,
+            y: 0,
+            width: app.w,
+            height: app.h,
+        },
+    )?;
+    app.label(
+        PAD,
+        PAD - 8,
+        "NIRU Wallpaper — keys",
+        app.palette.foreground,
+        18.0,
+    )?;
+    for (i, line) in help_lines().iter().enumerate() {
+        app.label(PAD, PAD + 40 + i as i16 * 26, line, app.palette.muted, 13.0)?;
     }
-
-    #[test]
-    fn the_smallest_window_still_shows_tiles() {
-        let l = layout(MIN_WIDTH, MIN_HEIGHT);
-        assert!(l.tiles_per_row >= 1, "no column at the minimum width");
-        assert!(l.visible_rows >= 1, "no row at the minimum height");
-        // The list must not be squeezed under the header or the panel.
-        assert!(l.left.height > 0 && l.panel.height > 0);
-    }
-
-    #[test]
-    fn clicks_on_the_tabs_are_recognised() {
-        let s = state();
-        let l = layout(960, 640);
-        let p = (l.tabs.0.x + 2, l.tabs.0.y + 2);
-        assert_eq!(hit(960, 640, p.0, p.1, &s), Some(Hit::Tab(Tab::Official)));
-        let p = (l.tabs.1.x + 2, l.tabs.1.y + 2);
-        assert_eq!(hit(960, 640, p.0, p.1, &s), Some(Hit::Tab(Tab::Mine)));
-    }
-
-    #[test]
-    fn the_apply_button_is_inside_the_panel() {
-        let l = layout(960, 640);
-        let r = apply_rect(&l);
-        assert!(r.x >= l.panel.x);
-        assert!(r.y + r.height as i16 <= l.panel.y + l.panel.height as i16);
-    }
-
-    #[test]
-    fn an_empty_area_is_not_a_click() {
-        let s = state();
-        assert_eq!(hit(960, 640, 5, 5, &s), None);
-    }
-
-    #[test]
-    fn picking_an_image_stops_theme_following_in_the_same_step() {
-        let mut s = state();
-        s.status.follow_theme = true;
-        s.list = vec![Wallpaper {
-            name: "Nord".into(),
-            path: PathBuf::from("/w/Nord.png"),
-            official: true,
-        }];
-        select_current(&mut s);
-        assert_eq!(s.pending.image, Some(PathBuf::from("/w/Nord.png")));
-        assert_eq!(
-            s.pending.follow_theme,
-            Some(false),
-            "choosing an image must not leave theme following on"
-        );
-    }
-
-    #[test]
-    fn applying_both_workflows_at_once_is_refused() {
-        let mut s = state();
-        s.pending.image = Some(PathBuf::from("/w/own.png"));
-        s.pending.follow_theme = Some(true);
-        let err = apply(&mut s).expect_err("a contradictory request must not be applied");
-        assert!(err.contains("either"), "{err}");
-    }
-
-    #[test]
-    fn a_pending_set_knows_when_it_is_empty() {
-        let mut p = Pending::default();
-        assert!(p.is_empty());
-        p.scale = Some("fit".into());
-        assert!(!p.is_empty());
-    }
-
-    #[test]
-    fn rotation_options_include_off() {
-        assert_eq!(ROTATIONS[0], 0, "the first rotation option turns it off");
-    }
+    app.label(
+        PAD,
+        app.h as i16 - 40,
+        "Press any key to return",
+        app.palette.muted,
+        12.0,
+    )?;
+    app.flush()
 }

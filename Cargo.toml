@@ -1,15 +1,19 @@
 [package]
 name = "niruwallpaper"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
-rust-version = "1.75"
+rust-version = "1.85"
 license = "MIT"
 description = "Graphical wallpaper settings for the NIRUX desktop"
 
 [dependencies]
 x11rb = { version = "0.13", features = ["randr"] }
-image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+# 0.25.8 keeps decode limits and the WebP/BMP decoders available while the
+# locked build still compiles with Rust 1.85; later 0.25 releases require 1.88.
+image = { version = "0.25.8", default-features = false, features = ["png", "jpeg", "webp", "bmp"] }
 ab_glyph = "0.2"
+# poll(2) for the event loop, already used throughout the suite.
+libc = "0.2"
 
 [profile.release]
 lto = true

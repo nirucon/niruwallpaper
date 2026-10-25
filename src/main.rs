@@ -5,6 +5,7 @@
 //! through `niructl`. It owns no settings and runs no wallpaper daemon.
 
 mod backend;
+mod screens;
 mod text;
 mod theme;
 mod thumbs;
@@ -57,6 +58,7 @@ fn usage() {
     println!("       niruwallpaper status   print the current wallpaper settings");
     println!("       niruwallpaper list     print the available wallpapers");
     println!("       niruwallpaper set PATH apply one image");
+    println!("       status lists each screen and the rendered result");
     println!("       niruwallpaper --version | --help");
 }
 
@@ -81,6 +83,28 @@ fn print_status() -> ExitCode {
             println!("rotation_minutes={}", status.rotation_minutes);
             println!("image={shown}");
             println!("theme_following={}", status.theme_following);
+            for screen in &status.screens {
+                println!(
+                    "screen={}\tsource={}\tmode={}\tscale={}\timage={}",
+                    screen.output, screen.source, screen.kind, screen.scale, screen.image
+                );
+            }
+            for rendered in &status.rendered {
+                println!(
+                    "rendered={}\tmode={}\timage={}{}",
+                    rendered.output,
+                    rendered.kind,
+                    rendered.image,
+                    if rendered.note.is_empty() {
+                        String::new()
+                    } else {
+                        format!("\tnote={}", rendered.note)
+                    }
+                );
+            }
+            if !status.has_rendered() && status.enabled {
+                println!("rendered=none\tNo running window manager confirmed the result");
+            }
             ExitCode::SUCCESS
         }
         Err(e) => {

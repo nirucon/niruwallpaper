@@ -1,5 +1,10 @@
 # Implementation prompt — NIRU Wallpaper
 
+Historical initial-build brief. The application is now implemented. For the
+current stabilization, multi-monitor and suite documentation assignment, use
+[FOLLOWUP-PROMPT.md](FOLLOWUP-PROMPT.md). Do not restart the original build or
+treat the historical brief as authorization for additional features.
+
 Use the following brief when the owner explicitly starts implementation.
 Complete a coherent, tested delivery rather than publishing speculative fixes.
 Do not promise completion in one unattended run or substitute weakened tests
