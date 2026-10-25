@@ -36,7 +36,7 @@ fn main() -> ExitCode {
             }
         },
         Some("--version") => {
-            println!("NIRU Wallpaper {}", env!("CARGO_PKG_VERSION"));
+            println!("NIRUWALLPAPER {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
         }
         Some("--help") => {
@@ -52,7 +52,7 @@ fn main() -> ExitCode {
 }
 
 fn usage() {
-    println!("NIRU Wallpaper {}", env!("CARGO_PKG_VERSION"));
+    println!("NIRUWALLPAPER {}", env!("CARGO_PKG_VERSION"));
     println!("Usage: niruwallpaper [open]");
     println!("       niruwallpaper status   print the current wallpaper settings");
     println!("       niruwallpaper list     print the available wallpapers");

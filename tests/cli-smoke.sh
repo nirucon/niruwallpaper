@@ -9,7 +9,11 @@ trap 'rm -rf "$tmp"' EXIT
 fail() { printf 'cli-smoke: %s\n' "$*" >&2; exit 1; }
 
 version=$("$bin" --version)
-case "$version" in "NIRU Wallpaper "*) ;; *) fail "unexpected version line: $version" ;; esac
+# NIRUX verifies a staged component by reading the second field of --version,
+# so the version must be exactly there.
+field=$(printf '%s\n' "$version" | awk '{print $2}')
+[ "$field" = "$(awk -F'"' '/^version = / {print $2; exit}' Cargo.toml)" ] ||
+  fail "the second field of --version must be the version, got $field"
 
 "$bin" --help | grep -q 'Usage: niruwallpaper' || fail '--help has no usage line'
 
