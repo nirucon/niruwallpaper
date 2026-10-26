@@ -1,12 +1,13 @@
 [package]
 name = "niruwallpaper"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 rust-version = "1.85"
 license = "MIT"
 description = "Graphical wallpaper settings for the NIRUX desktop"
 
 [dependencies]
+toml = "0.8"
 x11rb = { version = "0.13", features = ["randr"] }
 # 0.25.8 keeps decode limits and the WebP/BMP decoders available while the
 # locked build still compiles with Rust 1.85; later 0.25 releases require 1.88.

@@ -241,6 +241,7 @@ pub fn parse_status(text: &str) -> Status {
 /// Parse `niructl wallpaper list`, whose lines are `name<TAB>path`.
 pub fn parse_list(text: &str, theme_dir: &str) -> Vec<Wallpaper> {
     let theme_root = PathBuf::from(expand_home(theme_dir));
+    let theme_root = theme_root.canonicalize().unwrap_or(theme_root);
     text.lines()
         .filter_map(|line| {
             let (name, path) = line.split_once('\t')?;
@@ -250,7 +251,8 @@ pub fn parse_list(text: &str, theme_dir: &str) -> Vec<Wallpaper> {
             let path = PathBuf::from(path.trim());
             // `niructl` reports the theme directory in its own order first, so
             // membership in that directory is enough to call an entry official.
-            let official = path.starts_with(&theme_root);
+            let identity = path.canonicalize().unwrap_or_else(|_| path.clone());
+            let official = identity.starts_with(&theme_root);
             Some(Wallpaper {
                 name: name.trim().to_string(),
                 path,
@@ -642,6 +644,19 @@ pub const THEMES: [(&str, &str); 10] = [
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn official_images_remain_official_through_a_symlinked_theme_directory() {
+        let root = std::env::temp_dir().join(format!("niru-wallpaper-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("actual")).unwrap();
+        std::fs::write(root.join("actual/image.png"), b"fixture").unwrap();
+        std::os::unix::fs::symlink(root.join("actual"), root.join("Pictures")).unwrap();
+        let list = format!("Example\t{}", root.join("actual/image.png").display());
+        let entries = parse_list(&list, root.join("Pictures").to_str().unwrap());
+        assert!(entries[0].official);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     const SAMPLE: &str = "enabled=true\nmode=random\nrotation_minutes=10\n\
 scale=fill\nfollow_theme=true\nfile=\ndir=~/Pictures/Wallpapers\n\
