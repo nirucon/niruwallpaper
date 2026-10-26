@@ -15,6 +15,11 @@ the window manager about what is shown.
 
 - **Follow the theme** — use the selected NIRUX theme's own wallpaper, so a
   theme change also changes the wallpaper.
+- **Additional theme wallpapers** — after `nirux wallpapers download extras`,
+  the Carl Larsson and Erik Satie red/blue/green/noir variants appear under
+  **Official themes** beside the default image. Download them from that row in
+  the launcher under **Wallpaper**; this window remains the viewer and applies
+  through `niructl`.
 - **Choose a theme wallpaper** — keep the current theme but show a different
   picture from the installed set.
 - **Choose your own picture** — any picture in `~/Pictures/Wallpapers` (or the
