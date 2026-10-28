@@ -137,9 +137,7 @@ The program never modifies or deletes an image.
 
 ## Development
 
-Read [AGENTS.md](AGENTS.md) first. The original implementation brief is in
-[IMPLEMENTATION-PROMPT.md](IMPLEMENTATION-PROMPT.md). The current followup
-assignment is [FOLLOWUP-PROMPT.md](FOLLOWUP-PROMPT.md); neither document starts
-implementation without an explicit owner instruction. Where a brief and the
-shipped backend disagree, the backend's behaviour wins, because it is what the
-desktop actually does.
+Use the build and test commands above. Changes should preserve NIRUWM's ownership
+of wallpaper state and use the existing `niructl` interface. Historical execution
+briefs are no longer maintained in this repository; user-facing behavior is
+documented here and in the [NIRUX documentation](https://github.com/nirucon/nirux).
