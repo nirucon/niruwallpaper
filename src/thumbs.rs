@@ -177,9 +177,157 @@ fn write_cache(path: &Path, image: &image::RgbaImage) {
     let _ = fs::rename(&temp, path);
 }
 
+/// What a file looked like when its preview was made, so a replaced file is
+/// noticed without decoding it again.
+pub fn stamp(path: &Path) -> Option<(u64, SystemTime)> {
+    let meta = fs::metadata(path).ok()?;
+    Some((meta.len(), meta.modified().ok()?))
+}
+
+/// One decoded preview, or the knowledge that the file cannot be read.
+pub struct Entry {
+    /// `None` when the file is missing, broken or not a picture.
+    pub image: Option<image::RgbaImage>,
+    /// The size and modification time the preview was made from.
+    pub stamp: Option<(u64, SystemTime)>,
+    /// When the attempt finished, so a failure is retried later.
+    pub at: std::time::Instant,
+    used: u64,
+}
+
+/// Decoded previews in memory, least recently used dropped first.
+///
+/// A window that scrolls through hundreds of 8K pictures keeps only what it
+/// shows plus a margin, instead of every preview it ever decoded.
+pub struct Cache {
+    entries: std::collections::HashMap<PathBuf, Entry>,
+    clock: u64,
+    capacity: usize,
+}
+
+impl Cache {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            entries: std::collections::HashMap::new(),
+            clock: 0,
+            capacity: capacity.max(1),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Keep at least this many previews; the window raises it when it shows
+    /// more tiles than the cache would hold.
+    pub fn set_capacity(&mut self, capacity: usize) {
+        self.capacity = capacity.max(1);
+        self.evict();
+    }
+
+    pub fn get(&self, path: &Path) -> Option<&Entry> {
+        self.entries.get(path)
+    }
+
+    /// Mark a preview as just used, so it is the last to be dropped.
+    pub fn touch(&mut self, path: &Path) {
+        self.clock += 1;
+        if let Some(entry) = self.entries.get_mut(path) {
+            entry.used = self.clock;
+        }
+    }
+
+    pub fn insert(
+        &mut self,
+        path: PathBuf,
+        image: Option<image::RgbaImage>,
+        stamp: Option<(u64, SystemTime)>,
+    ) {
+        self.clock += 1;
+        self.entries.insert(
+            path,
+            Entry {
+                image,
+                stamp,
+                at: std::time::Instant::now(),
+                used: self.clock,
+            },
+        );
+        self.evict();
+    }
+
+    fn evict(&mut self) {
+        while self.entries.len() > self.capacity {
+            let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, e)| e.used)
+                .map(|(p, _)| p.clone())
+            else {
+                return;
+            };
+            self.entries.remove(&oldest);
+        }
+    }
+
+    /// Drop every preview whose file changed or disappeared, and every
+    /// failure, so the next look at them decodes the current file.
+    pub fn forget_changed(&mut self) {
+        self.entries
+            .retain(|path, entry| entry.image.is_some() && stamp(path) == entry.stamp);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_least_recently_used_preview_is_dropped_first() {
+        let mut cache = Cache::new(3);
+        let tiny = || Some(image::RgbaImage::new(1, 1));
+        for name in ["a", "b", "c"] {
+            cache.insert(PathBuf::from(name), tiny(), None);
+        }
+        // "a" is in view again, so "b" is now the oldest.
+        cache.touch(Path::new("a"));
+        cache.insert(PathBuf::from("d"), tiny(), None);
+        assert_eq!(cache.len(), 3);
+        assert!(cache.get(Path::new("a")).is_some());
+        assert!(
+            cache.get(Path::new("b")).is_none(),
+            "b was used least recently"
+        );
+        assert!(cache.get(Path::new("d")).is_some());
+        cache.set_capacity(1);
+        assert_eq!(cache.len(), 1);
+        assert!(cache.get(Path::new("d")).is_some());
+    }
+
+    #[test]
+    fn a_changed_file_or_a_failure_is_forgotten() {
+        let _guard = lock();
+        let dir = sandbox("forget");
+        let src = dir.0.join("w.png");
+        write_png(&src, 8, 8, 1);
+        let mut cache = Cache::new(8);
+        cache.insert(src.clone(), decode_preview(&src), stamp(&src));
+        cache.insert(dir.0.join("broken.png"), None, None);
+        cache.forget_changed();
+        assert!(
+            cache.get(&src).is_some(),
+            "an unchanged file keeps its preview"
+        );
+        assert!(cache.get(&dir.0.join("broken.png")).is_none());
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        write_png(&src, 16, 8, 2);
+        cache.forget_changed();
+        assert!(
+            cache.get(&src).is_none(),
+            "a replaced file is decoded again"
+        );
+    }
 
     struct Sandbox(PathBuf);
 

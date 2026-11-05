@@ -52,6 +52,11 @@ const GRID_GAP: i16 = 4;
 /// needs to appear without a restart. Nothing is rendered unless it changed.
 const REFRESH: Duration = Duration::from_millis(1000);
 
+/// Previews kept in memory: a few screens' worth of tiles at 320 pixels.
+const PREVIEW_CACHE: usize = 96;
+/// How long an unreadable file waits before it is tried again.
+const PREVIEW_RETRY: Duration = Duration::from_secs(10);
+
 /// Which list is showing.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Tab {
@@ -371,6 +376,7 @@ fn atom_id(atoms: &[(&'static str, u32)], name: &str) -> u32 {
 pub struct Thumb {
     pub path: PathBuf,
     pub image: Option<image::RgbaImage>,
+    pub stamp: Option<(u64, std::time::SystemTime)>,
 }
 
 pub struct App {
@@ -389,11 +395,11 @@ pub struct App {
     image_lsb: bool,
     root: Window,
     depth: u8,
-    /// Decoded previews, so a repaint never decodes an image.
-    thumbs: std::collections::HashMap<PathBuf, Option<image::RgbaImage>>,
-    /// Previews that failed, and when, so a broken file is not retried on
-    /// every repaint but a replaced file is.
-    failed: std::collections::HashMap<PathBuf, Instant>,
+    /// Decoded previews, so a repaint never decodes an image. A failure is
+    /// kept too, so a broken file is not retried on every repaint.
+    thumbs: thumbs::Cache,
+    /// Previews a worker is making now, so one is never asked for twice.
+    in_flight: std::collections::HashSet<PathBuf>,
     /// The screens RandR reports now.
     pub screens: Vec<Screen>,
     /// The screens seen on the last refresh, so a cable change is noticed.
@@ -548,8 +554,8 @@ impl App {
             image_lsb,
             root,
             depth,
-            thumbs: std::collections::HashMap::new(),
-            failed: std::collections::HashMap::new(),
+            thumbs: thumbs::Cache::new(PREVIEW_CACHE),
+            in_flight: std::collections::HashSet::new(),
             screens,
             seen_screens,
             xscreen: screen,
@@ -767,15 +773,17 @@ impl App {
         hit == Some(want) || focus == Some(want)
     }
 
-    /// Ask a worker for a preview if it is neither decoded nor known broken.
+    /// Ask a worker for a preview if it is neither decoded, nor being made,
+    /// nor recently found unreadable.
     fn want_thumb(&mut self, path: &Path) {
-        if self.thumbs.contains_key(path) {
-            return;
-        }
-        if let Some(at) = self.failed.get(path) {
-            if at.elapsed() < Duration::from_secs(10) {
+        if let Some(entry) = self.thumbs.get(path) {
+            if entry.image.is_some() || entry.at.elapsed() < PREVIEW_RETRY {
+                self.thumbs.touch(path);
                 return;
             }
+        }
+        if !self.in_flight.insert(path.to_path_buf()) {
+            return;
         }
         self.request_serial += 1;
         let serial = self.request_serial;
@@ -786,20 +794,20 @@ impl App {
     fn collect_thumbs(&mut self) -> bool {
         let mut changed = false;
         while let Ok((_, thumb)) = self.results.try_recv() {
-            if thumb.image.is_some() {
-                self.failed.remove(&thumb.path);
-                self.thumbs.insert(thumb.path.clone(), thumb.image);
-            } else {
-                self.failed.insert(thumb.path.clone(), Instant::now());
-                self.thumbs.insert(thumb.path, None);
-            }
+            self.in_flight.remove(&thumb.path);
+            self.thumbs.insert(thumb.path, thumb.image, thumb.stamp);
             changed = true;
         }
         changed
     }
 
     fn thumb(&self, path: &Path) -> Option<&image::RgbaImage> {
-        self.thumbs.get(path).and_then(|t| t.as_ref())
+        self.thumbs.get(path).and_then(|t| t.image.as_ref())
+    }
+
+    /// True when the file was tried and cannot be shown.
+    fn unreadable(&self, path: &Path) -> bool {
+        self.thumbs.get(path).is_some_and(|t| t.image.is_none())
     }
 
     /// Draw the whole window. One function so a click and a repaint can never
@@ -906,8 +914,8 @@ impl App {
             match self.thumb(&entry.path) {
                 Some(image) => self.image_fill(inner, image)?,
                 None => {
-                    let text = if self.failed.contains_key(&entry.path) {
-                        "(no preview)"
+                    let text = if self.unreadable(&entry.path) {
+                        "cannot read image"
                     } else {
                         "Loading preview"
                     };
@@ -1141,8 +1149,9 @@ fn spawn_workers(work: Receiver<(u64, PathBuf)>, done: Sender<(u64, Thumb)>) {
                 let Ok((serial, path)) = take(&work).ok_or(()) else {
                     return;
                 };
+                let stamp = thumbs::stamp(&path);
                 let image = thumbs::decode_preview(&path);
-                if done.send((serial, Thumb { path, image })).is_err() {
+                if done.send((serial, Thumb { path, image, stamp })).is_err() {
                     return;
                 }
             }
@@ -2068,6 +2077,7 @@ pub fn run(app: &mut App, state: &mut State, _palette: Palette) -> Result<(), St
             if let Err(err) = refresh(state) {
                 state.set_message(err, true);
             }
+            app.thumbs.forget_changed();
             dirty = true;
         } else if !handled && app.last_activity.elapsed() >= REFRESH {
             app.last_activity = Instant::now();
@@ -2077,6 +2087,7 @@ pub fn run(app: &mut App, state: &mut State, _palette: Palette) -> Result<(), St
             if let Err(err) = refresh(state) {
                 state.set_message(err, true);
             }
+            app.thumbs.forget_changed();
             dirty = true;
         }
         if dirty {
@@ -2266,18 +2277,27 @@ fn activate(state: &mut State, control: Hit) {
     }
 }
 
+/// The tiles whose previews are wanted now: every row that intersects the
+/// grid, including a partly visible one, plus one row of look-ahead below.
+pub fn preview_range(l: &Layout, scroll: usize, count: usize) -> std::ops::Range<usize> {
+    let per_row = l.tiles_per_row.max(1);
+    let first = scroll * per_row;
+    let mut rows = 0;
+    while intersects(tile_rect(l, first + rows * per_row, scroll), l.left) {
+        rows += 1;
+    }
+    let last = first + (rows + 1) * per_row;
+    first.min(count)..last.min(count)
+}
+
 /// Ask the workers for the previews of the tiles that are on screen.
 fn request_visible_previews(app: &mut App, state: &State) {
     let l = layout(app.w, app.h);
-    let first = state.scroll * l.tiles_per_row;
-    let last = first + l.tiles_per_row * l.visible_rows;
-    let paths: Vec<PathBuf> = state
-        .visible()
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| *i >= first && *i < last)
-        .map(|(_, entry)| entry.path.clone())
-        .collect();
+    let visible = state.visible();
+    let range = preview_range(&l, state.scroll, visible.len());
+    // The cache always holds what is on screen, with room to scroll back.
+    app.thumbs.set_capacity(PREVIEW_CACHE.max(range.len() * 3));
+    let paths: Vec<PathBuf> = visible[range].iter().map(|w| w.path.clone()).collect();
     for path in paths {
         app.want_thumb(&path);
     }
@@ -2429,6 +2449,21 @@ mod tests {
             handle_key(&mut state, K_UP, &l, None);
         }
         assert_eq!(state.scroll, 0);
+    }
+
+    #[test]
+    fn previews_load_for_partly_visible_rows_and_one_more() {
+        let l = layout(WIDTH, HEIGHT);
+        let per_row = l.tiles_per_row;
+        // Three full rows, one partly visible and one row of look-ahead.
+        assert_eq!(preview_range(&l, 0, 30), 0..per_row * 5);
+        assert_eq!(preview_range(&l, 2, 30), 2 * per_row..(7 * per_row).min(30));
+        // Never past the end of the list.
+        assert_eq!(preview_range(&l, 0, 3), 0..3);
+        assert_eq!(preview_range(&l, 0, 0), 0..0);
+        // The partly visible row really intersects the grid.
+        let partial = tile_rect(&l, l.visible_rows * per_row, 0);
+        assert!(intersects(partial, l.left));
     }
 
     #[test]
