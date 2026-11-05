@@ -15,3 +15,20 @@ jobs:
       # The command-line half needs no X server, so it runs here as well as on
       # the three distributions during release checks.
       - run: sh tests/cli-smoke.sh target/release/niruwallpaper
+  msrv:
+    # rust-version in Cargo.toml, which is also Debian 13's rustc.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85
+      - run: cargo build --release --locked
+      - run: cargo test --locked
+  xvfb:
+    # The window itself, under Xvfb, against a fixture niructl: the wheel,
+    # idle spawns and a slow Apply.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: sudo apt-get update && sudo apt-get install -y xvfb xdotool x11-apps
+      - run: cargo test --locked --test xvfb -- --ignored
