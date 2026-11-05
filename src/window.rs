@@ -124,6 +124,8 @@ pub struct State {
     pub busy: bool,
     /// The palette the window was last drawn with.
     pub palette: Palette,
+    /// Where each connected screen is, from RandR, for the screen map.
+    pub geometry: Vec<Screen>,
 }
 
 impl State {
@@ -247,6 +249,7 @@ pub fn load() -> Result<State, String> {
         seen,
         busy: false,
         palette: theme::load(),
+        geometry: Vec::new(),
     };
     if state.multi_screen() {
         // A second screen is the reason this window grew a screen choice.
@@ -899,12 +902,10 @@ impl App {
             self.button(rect, text, state.tab == tab, true)?;
         }
         if state.multi_screen() {
-            // The screen choice only exists when there is more than one screen.
-            let targets = targets(state);
-            for (i, rect) in screen_rects(&l, targets.len()).iter().enumerate() {
-                let label = target_short(&targets[i]);
-                self.button(*rect, &label, state.target == targets[i], true)?;
-            }
+            // The screen choice only exists when there is more than one
+            // screen: "All screens", then a small map of the screens as
+            // they are arranged, each one a button.
+            self.paint_screen_map(state, &l)?;
         }
 
         // Tiles.
@@ -1210,6 +1211,75 @@ impl App {
         Ok(())
     }
 
+    fn paint_screen_map(&self, state: &State, l: &Layout) -> Result<(), String> {
+        let targets = targets(state);
+        let rects = screen_rects(l, state);
+        let mut any_own = false;
+        for (i, rect) in rects.iter().enumerate() {
+            let target = &targets[i];
+            let chosen = state.target == *target;
+            let Target::Screen(name) = target else {
+                self.button(*rect, "All screens", chosen, true)?;
+                continue;
+            };
+            let own = screen_has_own(state, name);
+            any_own |= own;
+            let (bg, fg) = if chosen {
+                (self.palette.accent, self.palette.background)
+            } else {
+                (self.palette.surface, self.palette.foreground)
+            };
+            self.fill(self.palette.border, outset(*rect, 1))?;
+            self.fill(bg, *rect)?;
+            if own {
+                // A corner mark: this screen has its own picture.
+                self.fill(
+                    if chosen {
+                        self.palette.background
+                    } else {
+                        self.palette.accent
+                    },
+                    Rectangle {
+                        x: rect.x + rect.width as i16 - 9,
+                        y: rect.y + 3,
+                        width: 6,
+                        height: 6,
+                    },
+                )?;
+            }
+            let room = (rect.width as usize).saturating_sub(14) / 6;
+            if room >= 3 && rect.height >= 16 {
+                self.label_on(rect.x + 4, rect.y + 2, &truncate(name, room), fg, bg, 10.0)?;
+            }
+        }
+        if any_own {
+            if let Some(all) = rects.first() {
+                // Above "All screens" when the map is beside it, else beside
+                // it; clear of the grid's header row either way.
+                let map_above = rects
+                    .iter()
+                    .skip(1)
+                    .all(|r| r.y + (r.height as i16) <= all.y);
+                let (x, y) = if map_above {
+                    (all.x + all.width as i16 + 8, all.y + 8)
+                } else {
+                    (all.x, all.y - 18)
+                };
+                self.fill(
+                    self.palette.accent,
+                    Rectangle {
+                        x,
+                        y: y + 4,
+                        width: 6,
+                        height: 6,
+                    },
+                )?;
+                self.label(x + 10, y, "own picture", self.palette.muted, 10.0)?;
+            }
+        }
+        Ok(())
+    }
+
     /// The staged picture on a small copy of the chosen screen, scaled the
     /// way the selected mode would, so the scale buttons show their effect
     /// before Apply.
@@ -1382,13 +1452,6 @@ pub fn theme_label(slug: &str) -> String {
 /// A short, readable name for a RandR output: `eDP-1` stays as it is.
 pub fn screen_label(name: &str) -> String {
     name.to_string()
-}
-
-fn target_short(target: &Target) -> String {
-    match target {
-        Target::All => "All screens".to_string(),
-        Target::Screen(name) => truncate(name, 12),
-    }
 }
 
 /// The screen choices shown in the header: all screens first, then each one.
@@ -1652,7 +1715,7 @@ pub fn hit_rect(l: &Layout, hit: Hit, state: &State) -> Option<Rectangle> {
     Some(match hit {
         Hit::Tab(Tab::Official) => l.tabs.0,
         Hit::Tab(Tab::Mine) => l.tabs.1,
-        Hit::Screen(i) => *screen_rects(l, targets(state).len()).get(i as usize)?,
+        Hit::Screen(i) => *screen_rects(l, state).get(i as usize)?,
         Hit::Tile(i) => tile_rect(l, i, state.scroll),
         Hit::Scale(i) => *scale_rects(l).get(i as usize)?,
         Hit::Rotation(i) => *rotation_rects(l).get(i as usize)?,
@@ -1678,8 +1741,7 @@ pub fn hit(w: u16, h: u16, x: i16, y: i16, state: &State) -> Option<Hit> {
         }
     }
     if state.multi_screen() {
-        let targets = targets(state);
-        for (i, rect) in screen_rects(&l, targets.len()).iter().enumerate() {
+        for (i, rect) in screen_rects(&l, state).iter().enumerate() {
             if inside(*rect, x, y) {
                 return Some(Hit::Screen(i as u8));
             }
@@ -1742,20 +1804,113 @@ pub fn hit(w: u16, h: u16, x: i16, y: i16, state: &State) -> Option<Hit> {
     None
 }
 
-fn screen_rects(l: &Layout, count: usize) -> Vec<Rectangle> {
-    let mut out = Vec::new();
-    let mut x = l.tabs.1.x + l.tabs.1.width as i16 + 20;
-    for i in 0..count {
-        let width = if i == 0 { 100 } else { 92 };
-        out.push(Rectangle {
-            x,
-            y: l.screen_row,
-            width,
-            height: 28,
-        });
-        x += width as i16 + 6;
-    }
+/// True when a screen has a picture of its own instead of the shared one.
+pub fn screen_has_own(state: &State, name: &str) -> bool {
+    state
+        .status
+        .override_for(name)
+        .is_some_and(|o| !o.inherits())
+        || state.screen_plan(name).is_some_and(|p| p.overrides())
+}
+
+/// The screen choice in the header: "All screens" first, then one
+/// rectangle per screen, drawn to scale where RandR puts it.
+pub fn screen_rects(l: &Layout, state: &State) -> Vec<Rectangle> {
+    let x0 = l.tabs.1.x + l.tabs.1.width as i16 + 20;
+    let all = Rectangle {
+        x: x0,
+        y: l.screen_row,
+        width: 100,
+        height: 28,
+    };
+    // The panel's right edge is the window's right margin in both layouts.
+    let right = l.panel.x + l.panel.width as i16;
+    let beside = right - (x0 + 110);
+    // Beside "All screens" when there is room, else above it.
+    let region = if beside >= 120 {
+        Rectangle {
+            x: x0 + 110,
+            y: 8,
+            width: beside as u16,
+            height: (l.screen_row + 28 - 8).min(68) as u16,
+        }
+    } else {
+        Rectangle {
+            x: x0,
+            y: 6,
+            width: (right - x0).max(24) as u16,
+            height: (l.screen_row - 12).max(16) as u16,
+        }
+    };
+    let names = state.screens();
+    let geometry: Vec<Option<&Screen>> = names
+        .iter()
+        .map(|n| state.geometry.iter().find(|s| &s.name == n))
+        .collect();
+    let mut out = vec![all];
+    out.extend(screen_map(region, &geometry));
     out
+}
+
+/// Scale screens into `region`, keeping their arrangement. A screen without
+/// geometry gets a 16:9 place to the right of the others; mirrored screens
+/// (the same area) share it side by side.
+pub fn screen_map(region: Rectangle, screens: &[Option<&Screen>]) -> Vec<Rectangle> {
+    // Fill in made-up geometry for screens RandR did not describe.
+    let mut boxes: Vec<(i64, i64, i64, i64)> = Vec::new();
+    let mut next_x = screens
+        .iter()
+        .flatten()
+        .map(|s| i64::from(s.x) + i64::from(s.width))
+        .max()
+        .unwrap_or(0);
+    for screen in screens {
+        match screen {
+            Some(s) => boxes.push((
+                i64::from(s.x),
+                i64::from(s.y),
+                i64::from(s.width.max(1)),
+                i64::from(s.height.max(1)),
+            )),
+            None => {
+                boxes.push((next_x, 0, 1920, 1080));
+                next_x += 1920;
+            }
+        }
+    }
+    if boxes.is_empty() {
+        return Vec::new();
+    }
+    let min_x = boxes.iter().map(|b| b.0).min().unwrap_or(0);
+    let min_y = boxes.iter().map(|b| b.1).min().unwrap_or(0);
+    let max_x = boxes.iter().map(|b| b.0 + b.2).max().unwrap_or(1);
+    let max_y = boxes.iter().map(|b| b.1 + b.3).max().unwrap_or(1);
+    let (bw, bh) = ((max_x - min_x).max(1) as f64, (max_y - min_y).max(1) as f64);
+    let k = (f64::from(region.width) / bw).min(f64::from(region.height) / bh);
+    // Left-aligned, next to "All screens"; centred vertically.
+    let off_x = f64::from(region.x);
+    let off_y = f64::from(region.y) + (f64::from(region.height) - bh * k) / 2.0;
+    boxes
+        .iter()
+        .enumerate()
+        .map(|(i, b)| {
+            // Mirrored screens split their shared area into equal slices.
+            let group: Vec<usize> = (0..boxes.len()).filter(|j| boxes[*j] == *b).collect();
+            let slot = group.iter().position(|j| *j == i).unwrap_or(0) as f64;
+            let slice = b.2 as f64 / group.len() as f64;
+            let x = off_x + ((b.0 - min_x) as f64 + slice * slot) * k;
+            let y = off_y + (b.1 - min_y) as f64 * k;
+            let w = slice * k;
+            let h = b.3 as f64 * k;
+            // One pixel apart, so neighbours read as separate screens.
+            Rectangle {
+                x: x.round() as i16 + 1,
+                y: y.round() as i16 + 1,
+                width: (w.round() as i16 - 2).max(4) as u16,
+                height: (h.round() as i16 - 2).max(4) as u16,
+            }
+        })
+        .collect()
 }
 
 /// True when two rectangles overlap by at least one pixel.
@@ -2708,6 +2863,7 @@ fn handle_event(
 /// A screen that disappeared is dropped from the plan and the selection falls
 /// back to all screens; its saved settings stay in the file for a reconnect.
 pub fn sync_screens(app: &App, state: &mut State) {
+    state.geometry = app.screens.clone();
     sync_screen_names(app.screens.iter().map(|s| s.name.clone()), state);
 }
 
@@ -3371,6 +3527,7 @@ mod tests {
             seen: String::new(),
             busy: false,
             palette: Palette::fallback(),
+            geometry: Vec::new(),
         }
     }
 
@@ -3757,6 +3914,104 @@ mod tests {
             "the list stays open while copying"
         );
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    fn two_screens(state: &mut State) {
+        state.status.screens = ["DP-1", "HDMI-1"]
+            .iter()
+            .map(|name| backend::ScreenPlan {
+                output: name.to_string(),
+                source: if *name == "HDMI-1" {
+                    "override"
+                } else {
+                    "inherit"
+                }
+                .into(),
+                kind: "image".into(),
+                scale: "fill".into(),
+                image: String::new(),
+            })
+            .collect();
+        state.geometry = vec![
+            Screen {
+                name: "DP-1".into(),
+                x: 0,
+                y: 0,
+                width: 2560,
+                height: 1440,
+            },
+            Screen {
+                name: "HDMI-1".into(),
+                x: 2560,
+                y: 0,
+                width: 1080,
+                height: 1920,
+            },
+        ];
+    }
+
+    #[test]
+    fn the_screen_choice_is_a_map_of_the_screens() {
+        let mut state = fixture(4);
+        two_screens(&mut state);
+        let l = layout(WIDTH, HEIGHT);
+        let rects = screen_rects(&l, &state);
+        assert_eq!(rects.len(), 3, "All screens and two screens");
+        let (dp, hdmi) = (rects[1], rects[2]);
+        // Side by side as RandR has them, the portrait one taller and
+        // narrower, both in proportion.
+        assert!(hdmi.x > dp.x + dp.width as i16);
+        assert!(hdmi.height > dp.height && hdmi.width < dp.width);
+        let ratio = f64::from(dp.width + 2) / f64::from(dp.height + 2);
+        assert!((ratio - 16.0 / 9.0).abs() < 0.15, "{ratio}");
+        // Clear of the settings panel, and each is its own control.
+        for (i, r) in rects.iter().enumerate() {
+            assert!(!intersects(*r, l.panel), "{i}: {r:?}");
+            assert_eq!(
+                hit(WIDTH, HEIGHT, r.x + 2, r.y + 2, &state),
+                Some(Hit::Screen(i as u8))
+            );
+        }
+        assert!(screen_has_own(&state, "HDMI-1"));
+        assert!(!screen_has_own(&state, "DP-1"));
+        // Narrow: the map moves above "All screens" and still fits.
+        let narrow = layout(560, 1200);
+        let rects = screen_rects(&narrow, &state);
+        assert!(rects[1].y + (rects[1].height as i16) <= rects[0].y);
+        assert!(rects[2].x + rects[2].width as i16 <= 560 - PAD + 1);
+    }
+
+    #[test]
+    fn mirrored_and_unknown_screens_still_get_a_place() {
+        let region = Rectangle {
+            x: 0,
+            y: 0,
+            width: 200,
+            height: 60,
+        };
+        let a = Screen {
+            name: "eDP-1".into(),
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        };
+        let mirror = Screen {
+            name: "HDMI-1".into(),
+            ..a.clone()
+        };
+        let rects = screen_map(region, &[Some(&a), Some(&mirror)]);
+        assert!(
+            !intersects(rects[0], rects[1]),
+            "mirrors share the area side by side"
+        );
+        assert_eq!(rects[0].y, rects[1].y);
+        let rects = screen_map(region, &[Some(&a), None]);
+        assert!(
+            rects[1].x > rects[0].x,
+            "an unknown screen goes to the right"
+        );
+        assert!(screen_map(region, &[]).is_empty());
     }
 
     #[test]
