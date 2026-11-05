@@ -24,6 +24,7 @@ use x11rb::{
 
 use crate::backend::{self, Change, Status, Wallpaper};
 use crate::keyboard;
+use crate::preview;
 use crate::screens::{self, Screen};
 use crate::theme::{self, Palette};
 use crate::thumbs;
@@ -47,7 +48,7 @@ const FOOTER: i16 = 86;
 /// Space between the bottom of the grid and the status line.
 const GRID_GAP: i16 = 4;
 /// The settings panel's height when it sits below the grid.
-const PANEL_COMPACT_H: i16 = 460;
+const PANEL_COMPACT_H: i16 = 520;
 /// Width kept free at the grid's right edge for the scrollbar.
 const SCROLLBAR_ROOM: i16 = 20;
 
@@ -379,6 +380,8 @@ fn atom_id(atoms: &[(&'static str, u32)], name: &str) -> u32 {
 pub struct Thumb {
     pub path: PathBuf,
     pub image: Option<image::RgbaImage>,
+    /// The picture's own size, for the scale preview.
+    pub dims: Option<(u32, u32)>,
     pub stamp: Option<(u64, std::time::SystemTime)>,
 }
 
@@ -834,7 +837,8 @@ impl App {
         let mut changed = false;
         while let Ok((_, thumb)) = self.results.try_recv() {
             self.in_flight.remove(&thumb.path);
-            self.thumbs.insert(thumb.path, thumb.image, thumb.stamp);
+            self.thumbs
+                .insert(thumb.path, thumb.image, thumb.dims, thumb.stamp);
             changed = true;
         }
         changed
@@ -1087,7 +1091,7 @@ impl App {
             10.0,
         )?;
 
-        self.label(x, l.panel.y + 78, "Scale", self.palette.muted, 12.0)?;
+        self.label(x, l.panel.y + 76, "Scale", self.palette.muted, 12.0)?;
         let scale = state
             .pending
             .scale
@@ -1115,7 +1119,7 @@ impl App {
         };
         self.label(
             x,
-            l.panel.y + 144,
+            l.panel.y + 124,
             &truncate(&format!("In effect: {effective}"), 38),
             self.palette.muted,
             11.0,
@@ -1123,8 +1127,12 @@ impl App {
 
         self.label(
             x,
-            l.panel.y + 168,
-            "Rotate (minutes)",
+            l.panel.y + 144,
+            if state.status.rotation_possible() {
+                "Rotate (minutes)"
+            } else {
+                "Rotate (minutes): a single picture ignores it"
+            },
             self.palette.muted,
             12.0,
         )?;
@@ -1139,15 +1147,6 @@ impl App {
                 ROTATIONS[i].to_string()
             };
             self.button(*rect, &text, ROTATIONS[i] == rotation, !state.busy)?;
-        }
-        if !state.status.rotation_possible() {
-            self.label(
-                x,
-                l.panel.y + 224,
-                "A single picture ignores rotation.",
-                self.palette.muted,
-                11.0,
-            )?;
         }
 
         let follow = state
@@ -1170,7 +1169,7 @@ impl App {
         for (i, line) in lines.iter().enumerate() {
             self.label(
                 x,
-                l.panel.y + 292 + i as i16 * 18,
+                l.panel.y + 230 + i as i16 * 18,
                 &truncate(line, 42),
                 if i == 0 {
                     self.palette.foreground
@@ -1180,6 +1179,8 @@ impl App {
                 11.0,
             )?;
         }
+
+        self.paint_preview(state, l, &scale)?;
 
         self.button(
             apply_rect(l),
@@ -1194,6 +1195,118 @@ impl App {
             !state.pending.is_empty() && !state.busy,
         )?;
         Ok(())
+    }
+
+    /// The staged picture on a small copy of the chosen screen, scaled the
+    /// way the selected mode would, so the scale buttons show their effect
+    /// before Apply.
+    fn paint_preview(&self, state: &State, l: &Layout, scale: &str) -> Result<(), String> {
+        let Some(frame) = preview_rect(l) else {
+            return Ok(());
+        };
+        let (name, size) = preview_screen(state, &self.screens);
+        let image = preview_image(state);
+        self.label(
+            frame.x,
+            frame.y - 18,
+            &truncate(
+                &format!("Preview: {scale} on {name} {}\u{d7}{}", size.0, size.1),
+                (frame.width as usize / 6).max(8),
+            ),
+            self.palette.muted,
+            11.0,
+        )?;
+        let area = |r: Rectangle| preview::Area {
+            x: i32::from(r.x),
+            y: i32::from(r.y),
+            w: i32::from(r.width),
+            h: i32::from(r.height),
+        };
+        let on = preview::screen_in_frame(area(frame), size);
+        let screen = Rectangle {
+            x: on.x as i16,
+            y: on.y as i16,
+            width: on.w as u16,
+            height: on.h as u16,
+        };
+        // The screen's own background shows wherever the picture does not
+        // reach (fit, center), as the theme colour does on the desktop.
+        self.fill(self.palette.border, outset(screen, 1))?;
+        self.fill(self.palette.background, screen)?;
+        let entry = image.as_deref().and_then(|p| self.thumbs.get(p));
+        match (image.as_deref(), entry) {
+            (None, _) => {
+                self.label(
+                    screen.x + 6,
+                    screen.y + 6,
+                    "No picture: the theme colour",
+                    self.palette.muted,
+                    11.0,
+                )?;
+            }
+            (
+                Some(_),
+                Some(thumbs::Entry {
+                    image: Some(thumb),
+                    dims,
+                    ..
+                }),
+            ) => {
+                let dims = dims.unwrap_or((thumb.width(), thumb.height()));
+                let placed = preview::place(on, size, dims, scale);
+                if let Some(visible) = placed.intersect(on) {
+                    self.image_part(placed, visible, thumb)?;
+                }
+            }
+            (Some(_), entry) => {
+                let text = if entry.is_some() {
+                    "cannot read image"
+                } else {
+                    "Loading preview"
+                };
+                self.label(screen.x + 6, screen.y + 6, text, self.palette.muted, 11.0)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Draw the part `visible` of a picture placed at `placed`, from its
+    /// preview.
+    fn image_part(
+        &self,
+        placed: preview::Area,
+        visible: preview::Area,
+        thumb: &image::RgbaImage,
+    ) -> Result<(), String> {
+        let (tw, th) = (i64::from(thumb.width()), i64::from(thumb.height()));
+        let sx = |x: i32| (i64::from(x - placed.x) * tw / i64::from(placed.w.max(1))).clamp(0, tw);
+        let sy = |y: i32| (i64::from(y - placed.y) * th / i64::from(placed.h.max(1))).clamp(0, th);
+        let (x0, y0) = (sx(visible.x), sy(visible.y));
+        let (x1, y1) = (
+            sx(visible.x + visible.w).max(x0 + 1),
+            sy(visible.y + visible.h).max(y0 + 1),
+        );
+        let crop = image::imageops::crop_imm(
+            thumb,
+            x0 as u32,
+            y0 as u32,
+            (x1 - x0).min(tw - x0).max(1) as u32,
+            (y1 - y0).min(th - y0).max(1) as u32,
+        )
+        .to_image();
+        let scaled = image::imageops::resize(
+            &crop,
+            visible.w as u32,
+            visible.h as u32,
+            image::imageops::FilterType::Triangle,
+        );
+        self.upload(
+            visible.x as i16,
+            visible.y as i16,
+            visible.w as u16,
+            visible.h as u16,
+            scaled.as_raw(),
+        )
     }
 
     pub fn flush(&self) -> Result<(), String> {
@@ -1226,7 +1339,16 @@ fn spawn_workers(
                 };
                 let stamp = thumbs::stamp(&path);
                 let image = thumbs::decode_preview(&path);
-                if done.send((serial, Thumb { path, image, stamp })).is_err() {
+                let dims = image
+                    .as_ref()
+                    .and_then(|_| image::image_dimensions(&path).ok());
+                let thumb = Thumb {
+                    path,
+                    image,
+                    dims,
+                    stamp,
+                };
+                if done.send((serial, thumb)).is_err() {
                     return;
                 }
                 wake.notify();
@@ -1643,38 +1765,32 @@ fn tile_rect(l: &Layout, index: usize, scroll: usize) -> Rectangle {
 const SCALES: [&str; 4] = ["fill", "fit", "stretch", "center"];
 const ROTATIONS: [u32; 5] = [0, 5, 10, 30, 60];
 
+/// `count` buttons side by side across the panel, `gap` pixels apart.
+fn panel_row(l: &Layout, y: i16, height: u16, count: usize, gap: i16) -> Vec<Rectangle> {
+    let inner = l.panel.width as i16 - 24;
+    let width = ((inner - gap * (count as i16 - 1)) / count as i16).max(1);
+    (0..count)
+        .map(|i| Rectangle {
+            x: l.panel.x + 12 + i as i16 * (width + gap),
+            y,
+            width: width as u16,
+            height,
+        })
+        .collect()
+}
+
 fn scale_rects(l: &Layout) -> Vec<Rectangle> {
-    let mut out = Vec::new();
-    let y = l.panel.y + 96;
-    for i in 0..SCALES.len() {
-        out.push(Rectangle {
-            x: l.panel.x + 12 + (i as i16 % 2) * 138,
-            y: y + (i as i16 / 2) * 30,
-            width: 130,
-            height: 26,
-        });
-    }
-    out
+    panel_row(l, l.panel.y + 94, 26, SCALES.len(), 6)
 }
 
 fn rotation_rects(l: &Layout) -> Vec<Rectangle> {
-    let mut out = Vec::new();
-    let y = l.panel.y + 186;
-    for i in 0..ROTATIONS.len() {
-        out.push(Rectangle {
-            x: l.panel.x + 12 + (i as i16 % 3) * 92,
-            y: y + (i as i16 / 3) * 28,
-            width: 86,
-            height: 24,
-        });
-    }
-    out
+    panel_row(l, l.panel.y + 162, 24, ROTATIONS.len(), 6)
 }
 
 fn follow_rect(l: &Layout) -> Rectangle {
     Rectangle {
         x: l.panel.x + 12,
-        y: l.panel.y + 250,
+        y: l.panel.y + 194,
         width: l.panel.width.saturating_sub(24),
         height: 28,
     }
@@ -1689,21 +1805,83 @@ fn settings_rect(l: &Layout) -> Rectangle {
     }
 }
 
+/// Apply and Discard share the panel's last row.
 fn apply_rect(l: &Layout) -> Rectangle {
-    Rectangle {
-        x: l.panel.x + 12,
-        y: l.panel.y + l.panel.height as i16 - 96,
-        width: l.panel.width.saturating_sub(24),
-        height: 36,
-    }
+    panel_row(l, l.panel.y + l.panel.height as i16 - 52, 36, 2, 8)[0]
 }
 
 fn cancel_rect(l: &Layout) -> Rectangle {
-    Rectangle {
+    panel_row(l, l.panel.y + l.panel.height as i16 - 52, 36, 2, 8)[1]
+}
+
+/// The space for the staged picture's preview: between the description
+/// lines and Apply. `None` when the window is too short for one.
+pub fn preview_rect(l: &Layout) -> Option<Rectangle> {
+    let top = l.panel.y + 306;
+    let bottom = apply_rect(l).y - 10;
+    (bottom - top >= 40).then(|| Rectangle {
         x: l.panel.x + 12,
-        y: l.panel.y + l.panel.height as i16 - 52,
+        y: top,
         width: l.panel.width.saturating_sub(24),
-        height: 32,
+        height: (bottom - top) as u16,
+    })
+}
+
+/// A rectangle grown by `by` pixels on every side.
+fn outset(r: Rectangle, by: i16) -> Rectangle {
+    Rectangle {
+        x: r.x - by,
+        y: r.y - by,
+        width: r.width + 2 * by as u16,
+        height: r.height + 2 * by as u16,
+    }
+}
+
+/// The picture the chosen screen (or the screens that inherit) would show
+/// after Apply: the staged one, or the one shown now.
+pub fn preview_image(state: &State) -> Option<PathBuf> {
+    if let Some(path) = &state.pending.image {
+        return Some(path.clone());
+    }
+    let status = &state.status;
+    let theme = || (!status.theme_image.is_empty()).then(|| PathBuf::from(&status.theme_image));
+    if state.pending.follow_theme == Some(true) {
+        return theme();
+    }
+    let inherited = || {
+        status
+            .screens
+            .iter()
+            .find(|s| !s.overrides() && !s.image.is_empty())
+            .map(|s| PathBuf::from(&s.image))
+            .or_else(|| status.active_image().map(PathBuf::from))
+    };
+    match &state.target {
+        Target::All => inherited(),
+        Target::Screen(_) if state.pending.inherit => inherited(),
+        Target::Screen(name) => state
+            .screen_rendered(name)
+            .map(|r| r.image.clone())
+            .filter(|i| !i.is_empty())
+            .or_else(|| state.screen_plan(name).map(|p| p.image.clone()))
+            .filter(|i| !i.is_empty())
+            .map(PathBuf::from),
+    }
+}
+
+/// The screen the preview is drawn on: the chosen one, or for all screens
+/// the first that inherits the shared settings. Its name and pixel size.
+pub fn preview_screen(state: &State, screens: &[Screen]) -> (String, (u32, u32)) {
+    let chosen = match &state.target {
+        Target::Screen(name) => screens.iter().find(|s| &s.name == name),
+        Target::All => screens
+            .iter()
+            .find(|s| state.screen_plan(&s.name).is_some_and(|p| !p.overrides()))
+            .or_else(|| screens.first()),
+    };
+    match chosen {
+        Some(s) => (s.name.clone(), (s.width, s.height)),
+        None => ("screen".into(), (1920, 1080)),
     }
 }
 
@@ -2694,7 +2872,10 @@ fn request_visible_previews(app: &mut App, state: &State) {
     let range = preview_range(&l, state.scroll, visible.len());
     // The cache always holds what is on screen, with room to scroll back.
     app.thumbs.set_capacity(PREVIEW_CACHE.max(range.len() * 3));
-    let paths: Vec<PathBuf> = visible[range].iter().map(|w| w.path.clone()).collect();
+    let mut paths: Vec<PathBuf> = visible[range].iter().map(|w| w.path.clone()).collect();
+    // The staged picture may be scrolled out of the grid; the panel's
+    // preview still needs it.
+    paths.extend(preview_image(state));
     for path in paths {
         app.want_thumb(&path);
     }
@@ -3007,6 +3188,76 @@ mod tests {
         handle_key(&mut state, K_HOME, &l, None);
         assert_eq!((state.selected, state.scroll), (0, 0));
         assert!(state.pending.is_empty(), "paging never stages");
+    }
+
+    #[test]
+    fn the_preview_shows_the_staged_picture_on_the_chosen_screen() {
+        let mut state = fixture(6);
+        state.status.theme_image = "/fixture/theme.png".into();
+        state.status.screens = vec![
+            backend::ScreenPlan {
+                output: "eDP-1".into(),
+                source: "override".into(),
+                kind: "image".into(),
+                scale: "fit".into(),
+                image: "/fixture/own.png".into(),
+            },
+            backend::ScreenPlan {
+                output: "DP-1".into(),
+                source: "inherit".into(),
+                kind: "theme".into(),
+                scale: "fill".into(),
+                image: "/fixture/theme.png".into(),
+            },
+        ];
+        let screens = vec![
+            Screen {
+                name: "eDP-1".into(),
+                x: 0,
+                y: 0,
+                width: 1920,
+                height: 1200,
+            },
+            Screen {
+                name: "DP-1".into(),
+                x: 1920,
+                y: 0,
+                width: 1080,
+                height: 1920,
+            },
+        ];
+        // All screens: what the inheriting screen shows, on that screen.
+        assert_eq!(
+            preview_image(&state),
+            Some(PathBuf::from("/fixture/theme.png"))
+        );
+        assert_eq!(
+            preview_screen(&state, &screens),
+            ("DP-1".to_string(), (1080, 1920))
+        );
+        // One screen: its own picture, on itself.
+        state.target = Target::Screen("eDP-1".into());
+        assert_eq!(
+            preview_image(&state),
+            Some(PathBuf::from("/fixture/own.png"))
+        );
+        assert_eq!(preview_screen(&state, &screens).1, (1920, 1200));
+        // A staged picture wins.
+        state.selected = 3;
+        select_current(&mut state);
+        assert_eq!(
+            preview_image(&state),
+            Some(PathBuf::from("/fixture/w03.png"))
+        );
+        // No screens reported: a 1080p stand-in.
+        assert_eq!(preview_screen(&state, &[]).1, (1920, 1080));
+        // There is room for a real preview at the default size, and it sits
+        // between the description and Apply.
+        let l = layout(WIDTH, HEIGHT);
+        let frame = preview_rect(&l).expect("room for a preview");
+        assert!(frame.height >= 140, "{frame:?}");
+        assert!(frame.y + frame.height as i16 <= apply_rect(&l).y);
+        assert!(frame.y >= follow_rect(&l).y + 28 + 3 * 18);
     }
 
     #[test]

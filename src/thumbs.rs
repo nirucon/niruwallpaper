@@ -188,6 +188,8 @@ pub fn stamp(path: &Path) -> Option<(u64, SystemTime)> {
 pub struct Entry {
     /// `None` when the file is missing, broken or not a picture.
     pub image: Option<image::RgbaImage>,
+    /// The picture's own width and height.
+    pub dims: Option<(u32, u32)>,
     /// The size and modification time the preview was made from.
     pub stamp: Option<(u64, SystemTime)>,
     /// When the attempt finished, so a failure is retried later.
@@ -242,6 +244,7 @@ impl Cache {
         &mut self,
         path: PathBuf,
         image: Option<image::RgbaImage>,
+        dims: Option<(u32, u32)>,
         stamp: Option<(u64, SystemTime)>,
     ) {
         self.clock += 1;
@@ -249,6 +252,7 @@ impl Cache {
             path,
             Entry {
                 image,
+                dims,
                 stamp,
                 at: std::time::Instant::now(),
                 used: self.clock,
@@ -288,11 +292,11 @@ mod tests {
         let mut cache = Cache::new(3);
         let tiny = || Some(image::RgbaImage::new(1, 1));
         for name in ["a", "b", "c"] {
-            cache.insert(PathBuf::from(name), tiny(), None);
+            cache.insert(PathBuf::from(name), tiny(), None, None);
         }
         // "a" is in view again, so "b" is now the oldest.
         cache.touch(Path::new("a"));
-        cache.insert(PathBuf::from("d"), tiny(), None);
+        cache.insert(PathBuf::from("d"), tiny(), None, None);
         assert_eq!(cache.len(), 3);
         assert!(cache.get(Path::new("a")).is_some());
         assert!(
@@ -312,8 +316,8 @@ mod tests {
         let src = dir.0.join("w.png");
         write_png(&src, 8, 8, 1);
         let mut cache = Cache::new(8);
-        cache.insert(src.clone(), decode_preview(&src), stamp(&src));
-        cache.insert(dir.0.join("broken.png"), None, None);
+        cache.insert(src.clone(), decode_preview(&src), None, stamp(&src));
+        cache.insert(dir.0.join("broken.png"), None, None, None);
         cache.forget_changed();
         assert!(
             cache.get(&src).is_some(),
