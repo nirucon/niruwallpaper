@@ -6,9 +6,18 @@
 //! what is actually applied.
 
 use std::{
+    io::Read,
+    os::unix::io::AsRawFd,
     path::PathBuf,
-    process::{Command, Output},
+    process::{Command, Output, Stdio},
+    time::{Duration, Instant},
 };
+
+/// How long a question to `niructl` may take before it is given up.
+pub const READ_DEADLINE: Duration = Duration::from_secs(10);
+/// How long an Apply may take. NIRUWM composes each output with ffmpeg,
+/// which takes seconds for 8K pictures on several monitors.
+pub const APPLY_DEADLINE: Duration = Duration::from_secs(30);
 
 /// One image the bar and the window manager would accept.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -195,11 +204,128 @@ pub fn niructl() -> Result<PathBuf, String> {
 }
 
 fn run(args: &[&str]) -> Result<Output, String> {
+    run_within(args, READ_DEADLINE)
+}
+
+/// Run `program` and collect its output, but never for longer than
+/// `deadline`. The pipes are read without blocking, so a program that
+/// stops answering (or leaves a child holding its stdout) cannot hang the
+/// caller; it is killed and reaped when the time is up.
+pub fn output_within(program: &mut Command, deadline: Duration) -> std::io::Result<Output> {
+    let started = Instant::now();
+    let mut child = program
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let mut pipes = [
+        child.stdout.take().map(Pipe::new),
+        child.stderr.take().map(Pipe::new),
+    ];
+    let mut expired = false;
+    while pipes.iter().any(|p| p.as_ref().is_some_and(|p| p.open)) {
+        let Some(left) = deadline.checked_sub(started.elapsed()) else {
+            expired = true;
+            break;
+        };
+        let mut fds: Vec<libc::pollfd> = pipes
+            .iter()
+            .flatten()
+            .filter(|p| p.open)
+            .map(|p| libc::pollfd {
+                fd: p.fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            })
+            .collect();
+        let ms = left.as_millis().clamp(1, i32::MAX as u128) as i32;
+        // SAFETY: a live array of pollfd structures and its length.
+        unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, ms) };
+        for pipe in pipes.iter_mut().flatten() {
+            pipe.read_available();
+        }
+    }
+    // The pipes are closed: wait for the exit, still within the deadline.
+    let status = loop {
+        if expired {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("no answer within {} s", deadline.as_secs()),
+            ));
+        }
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if started.elapsed() >= deadline {
+            expired = true;
+            continue;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    let [stdout, stderr] = pipes.map(|p| p.map(|p| p.data).unwrap_or_default());
+    Ok(Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+/// One output pipe of a child, read without blocking.
+struct Pipe {
+    reader: Box<dyn Read>,
+    fd: libc::c_int,
+    data: Vec<u8>,
+    open: bool,
+}
+
+impl Pipe {
+    fn new(reader: impl Read + AsRawFd + 'static) -> Self {
+        let fd = reader.as_raw_fd();
+        // SAFETY: changing the flags of a descriptor this process owns.
+        unsafe {
+            let flags = libc::fcntl(fd, libc::F_GETFL);
+            libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+        Self {
+            reader: Box::new(reader),
+            fd,
+            data: Vec::new(),
+            open: true,
+        }
+    }
+
+    fn fd(&self) -> libc::c_int {
+        self.fd
+    }
+
+    fn read_available(&mut self) {
+        let mut buf = [0u8; 8192];
+        while self.open {
+            match self.reader.read(&mut buf) {
+                Ok(0) => self.open = false,
+                Ok(n) => self.data.extend_from_slice(&buf[..n]),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => self.open = false,
+            }
+        }
+    }
+}
+
+fn run_within(args: &[&str], deadline: Duration) -> Result<Output, String> {
     let bin = niructl()?;
-    let out = Command::new(&bin)
-        .args(args)
-        .output()
-        .map_err(|e| format!("cannot run {}: {e}", bin.display()))?;
+    let out = output_within(Command::new(&bin).args(args), deadline).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::TimedOut {
+            format!(
+                "niructl gave no answer within {} s and was stopped",
+                deadline.as_secs()
+            )
+        } else {
+            format!("cannot run {}: {e}", bin.display())
+        }
+    })?;
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
         let why = err
@@ -630,7 +756,7 @@ pub fn apply_change(change: &Change) -> Result<(), String> {
     }
     let args = change.args();
     let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
-    run(&borrowed).map(|_| ())
+    run_within(&borrowed, APPLY_DEADLINE).map(|_| ())
 }
 
 /// Theme slugs NIRUX installs, in the order the suite presents them.
@@ -863,6 +989,38 @@ Holiday\t/home/u/Pictures/holiday.png\n\nbroken line without tab\n";
             .args()
             .ends_with(&["--output-inherit".to_string(), "HDMI-1".to_string()]));
         assert!(Change::default().is_empty());
+    }
+
+    #[test]
+    fn a_program_that_does_not_answer_is_stopped_at_the_deadline() {
+        let started = Instant::now();
+        let err = output_within(
+            Command::new("sh").args(["-c", "echo started; sleep 30"]),
+            Duration::from_millis(300),
+        )
+        .expect_err("the deadline must stop it");
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(5));
+        // A child that keeps stdout open after its parent exits cannot hold
+        // the caller either.
+        let started = Instant::now();
+        let _ = output_within(
+            Command::new("sh").args(["-c", "sleep 30 & echo done"]),
+            Duration::from_millis(300),
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn a_quick_program_is_read_completely() {
+        let out = output_within(
+            Command::new("sh").args(["-c", "seq 1 20000; echo oops >&2; exit 3"]),
+            Duration::from_secs(10),
+        )
+        .unwrap();
+        assert_eq!(out.status.code(), Some(3));
+        assert_eq!(String::from_utf8_lossy(&out.stdout).lines().count(), 20000);
+        assert_eq!(out.stderr, b"oops\n");
     }
 
     #[test]

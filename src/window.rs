@@ -413,6 +413,10 @@ pub struct App {
     debounce: watch::Debounce,
     /// Workers write here to wake the event loop.
     wake: Arc<watch::Wake>,
+    /// The Apply in progress and the channel its worker answers on.
+    apply_job: ApplyJob,
+    apply_done: Sender<(u64, ApplyResult)>,
+    apply_results: Receiver<(u64, ApplyResult)>,
     /// True when a monitor configuration change was seen; the screens are
     /// then re-read from RandR without waiting for the next refresh.
     screens_dirty: bool,
@@ -552,6 +556,7 @@ impl App {
         let (requests, work) = mpsc::channel::<(u64, PathBuf)>();
         let (done, results) = mpsc::channel::<(u64, Thumb)>();
         spawn_workers(work, done, wake.clone());
+        let (apply_done, apply_results) = mpsc::channel::<(u64, ApplyResult)>();
 
         Ok(Self {
             c,
@@ -578,6 +583,9 @@ impl App {
             watcher,
             debounce: watch::Debounce::default(),
             wake,
+            apply_job: ApplyJob::default(),
+            apply_done,
+            apply_results,
             screens_dirty: false,
         })
     }
@@ -1615,6 +1623,10 @@ fn cancel_rect(l: &Layout) -> Rectangle {
 
 /// Stage the currently selected image for the current target.
 pub fn select_current(state: &mut State) {
+    if state.busy {
+        // The staged change is being applied; it cannot change meanwhile.
+        return;
+    }
     let picked = state
         .current()
         .map(|entry| (entry.name.clone(), entry.path.clone()));
@@ -1679,20 +1691,32 @@ pub fn staged_change(state: &State) -> Result<Change, String> {
     Ok(change)
 }
 
-/// Apply the staged changes as one transaction and take the desktop's answer.
-///
-/// Kept separate from the event loop so a test can drive it without a window:
-/// the `command` argument is what really runs it.
-pub fn apply_with<F>(state: &mut State, command: F) -> Result<(), String>
+/// What a finished Apply brought back: the desktop's new state, or why it
+/// failed.
+pub type ApplyResult = Result<(Status, Vec<Wallpaper>), String>;
+
+/// Run one change and read the desktop's answer. This is what the Apply
+/// worker thread does, with `backend::apply_change` as `command`.
+pub fn apply_and_fetch<F>(change: &Change, command: F) -> ApplyResult
 where
     F: FnOnce(&Change) -> Result<(), String>,
 {
-    let change = staged_change(state)?;
-    if change.is_empty() {
-        return Ok(());
-    }
-    command(&change)?;
-    let (status, list) = fetch()?;
+    command(change)?;
+    fetch()
+}
+
+/// Take the result of an Apply into the window state.
+///
+/// A failure keeps the staged changes, so Apply can be tried again.
+pub fn finish_apply(state: &mut State, result: ApplyResult) {
+    state.busy = false;
+    let (status, list) = match result {
+        Ok(answer) => answer,
+        Err(err) => {
+            state.set_message(err, true);
+            return;
+        }
+    };
     let target = state.target.clone();
     state.status = status;
     state.list = list;
@@ -1723,12 +1747,47 @@ where
         Some(text) => state.set_message(text, true),
         None => state.set_message("Applied", false),
     }
-    Ok(())
 }
 
-/// The real transaction: one `niructl wallpaper apply`.
-pub fn apply(state: &mut State) -> Result<(), String> {
-    apply_with(state, backend::apply_change)
+/// The Apply in progress, so only its own answer is taken and a late one
+/// (after the window gave up waiting) is ignored.
+#[derive(Debug, Default)]
+pub struct ApplyJob {
+    serial: u64,
+    started: Option<Instant>,
+}
+
+impl ApplyJob {
+    /// Start a new Apply and return its serial.
+    pub fn start(&mut self, now: Instant) -> u64 {
+        self.serial += 1;
+        self.started = Some(now);
+        self.serial
+    }
+
+    /// True when `serial` is the Apply the window is waiting for; it is then
+    /// finished.
+    pub fn accept(&mut self, serial: u64) -> bool {
+        if self.started.is_some() && serial == self.serial {
+            self.started = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// How long the window still waits, or `None` when nothing is running.
+    /// The worker's own deadline stops niructl first; this is the backstop.
+    pub fn remaining(&self, now: Instant) -> Option<Duration> {
+        let limit = backend::APPLY_DEADLINE + backend::READ_DEADLINE * 2 + Duration::from_secs(1);
+        self.started
+            .map(|at| (at + limit).saturating_duration_since(now))
+    }
+
+    /// Give up waiting: whatever answer comes later is ignored.
+    pub fn abandon(&mut self) {
+        self.started = None;
+    }
 }
 
 /// Keysyms for the keys the window answers to.
@@ -2019,6 +2078,9 @@ pub fn run(app: &mut App, state: &mut State, _palette: Palette) -> Result<(), St
         if app.collect_thumbs() {
             ui.dirty = true;
         }
+        if collect_apply(app, state) {
+            ui.dirty = true;
+        }
         if app.watcher.drain() {
             app.debounce.note(Instant::now());
         }
@@ -2052,7 +2114,8 @@ pub fn run(app: &mut App, state: &mut State, _palette: Palette) -> Result<(), St
             continue;
         }
         let timeout = if state.busy {
-            None
+            // Waiting for the Apply worker, which wakes the loop itself.
+            app.apply_job.remaining(Instant::now())
         } else {
             app.debounce.timeout(Instant::now())
         };
@@ -2113,8 +2176,10 @@ fn handle_event(
             // shadows the plain letters people already use here.
             let ctrl = e.state.contains(KeyButMask::CONTROL);
             if ctrl && key == K_D {
-                state.pending = Pending::default();
-                state.set_message("Discarded staged changes", false);
+                if !state.busy {
+                    state.pending = Pending::default();
+                    state.set_message("Discarded staged changes", false);
+                }
                 ui.focus = None;
                 ui.help = false;
                 return Ok(Flow::Continue);
@@ -2131,16 +2196,13 @@ fn handle_event(
             match handle_key(state, key, &l, ui.focus) {
                 KeyAction::Quit => return Ok(Flow::Quit),
                 KeyAction::Apply => {
-                    run_apply(app, state, ui.focus)?;
+                    run_apply(app, state);
                     ui.focus = None;
                 }
                 KeyAction::Select => select_current(state),
-                KeyAction::Discard => {
-                    state.pending = Pending::default();
-                    state.set_message("Discarded staged changes", false);
-                }
+                KeyAction::Discard => activate(state, Hit::Cancel),
                 KeyAction::Activate(Hit::Apply) => {
-                    run_apply(app, state, ui.focus)?;
+                    run_apply(app, state);
                     ui.focus = None;
                 }
                 KeyAction::Activate(control) => activate(state, control),
@@ -2176,7 +2238,7 @@ fn handle_event(
                     ui.focus = None;
                 }
                 Some(Hit::Apply) => {
-                    run_apply(app, state, None)?;
+                    run_apply(app, state);
                     ui.focus = None;
                 }
                 Some(Hit::Cancel) => {
@@ -2278,27 +2340,62 @@ fn wait_for_input(app: &App, timeout: Option<Duration>) {
     let _ = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, ms) };
 }
 
-/// Show "applying", run the transaction, and leave the result in the footer.
-fn run_apply(app: &mut App, state: &mut State, focus: Option<Hit>) -> Result<(), String> {
+/// Start the staged change on a worker thread and show "Applying…".
+///
+/// The window keeps painting and answering keys meanwhile; the controls that
+/// change the staged settings are disabled until the answer arrives.
+fn run_apply(app: &mut App, state: &mut State) {
     if state.busy {
-        return Ok(());
+        return;
+    }
+    let change = match staged_change(state) {
+        Ok(change) => change,
+        Err(err) => {
+            state.set_message(err, true);
+            return;
+        }
+    };
+    if change.is_empty() {
+        return;
     }
     state.busy = true;
-    app.paint(state, focus)?;
-    app.flush()?;
-    let result = apply(state);
-    state.busy = false;
-    if let Err(err) = result {
-        state.set_message(err, true);
+    let serial = app.apply_job.start(Instant::now());
+    let done = app.apply_done.clone();
+    let wake = app.wake.clone();
+    thread::spawn(move || {
+        let result = apply_and_fetch(&change, backend::apply_change);
+        let _ = done.send((serial, result));
+        wake.notify();
+    });
+}
+
+/// Take a finished Apply, or give up on one that ran out of time.
+fn collect_apply(app: &mut App, state: &mut State) -> bool {
+    let mut changed = false;
+    while let Ok((serial, result)) = app.apply_results.try_recv() {
+        if app.apply_job.accept(serial) {
+            finish_apply(state, result);
+            changed = true;
+        }
     }
-    app.paint(state, focus)?;
-    app.flush()?;
-    Ok(())
+    if state.busy && app.apply_job.remaining(Instant::now()) == Some(Duration::ZERO) {
+        app.apply_job.abandon();
+        finish_apply(
+            state,
+            Err("Applying took too long; the desktop did not answer. Your changes are still staged.".into()),
+        );
+        changed = true;
+    }
+    changed
 }
 
 /// Activating a control changes the staged settings. Apply is handled by the
 /// caller, which runs the transaction.
 fn activate(state: &mut State, control: Hit) {
+    if state.busy && !matches!(control, Hit::Tab(_)) {
+        // Only looking around is possible while the change is applied.
+        return;
+    }
     match control {
         Hit::Tab(tab) => {
             state.tab = tab;
@@ -2559,6 +2656,56 @@ mod tests {
         // The partly visible row really intersects the grid.
         let partial = tile_rect(&l, l.visible_rows * per_row, 0);
         assert!(intersects(partial, l.left));
+    }
+
+    #[test]
+    fn only_the_awaited_apply_is_taken_and_a_late_one_is_ignored() {
+        let t0 = Instant::now();
+        let mut job = ApplyJob::default();
+        assert_eq!(job.remaining(t0), None, "nothing to wait for");
+        let first = job.start(t0);
+        assert!(job.remaining(t0).unwrap() > backend::APPLY_DEADLINE);
+        // The window gives up; the first answer arrives late.
+        job.abandon();
+        assert!(!job.accept(first), "a late answer is ignored");
+        let second = job.start(t0);
+        assert!(!job.accept(first), "an older answer is ignored");
+        assert!(job.accept(second));
+        assert!(!job.accept(second), "an answer is taken once");
+        assert_eq!(
+            job.start(t0),
+            second + 1,
+            "serials only grow, so an old answer never matches"
+        );
+        let far = t0 + Duration::from_secs(600);
+        assert_eq!(job.remaining(far), Some(Duration::ZERO));
+    }
+
+    #[test]
+    fn nothing_is_staged_while_applying_and_a_failure_keeps_the_change() {
+        let mut state = fixture(8);
+        state.selected = 2;
+        select_current(&mut state);
+        let staged = state.pending.clone();
+        state.busy = true;
+        state.selected = 3;
+        select_current(&mut state);
+        activate(&mut state, Hit::Scale(1));
+        activate(&mut state, Hit::Cancel);
+        assert_eq!(state.pending, staged, "the change being applied was edited");
+        finish_apply(&mut state, Err("niructl gave no answer".into()));
+        assert!(!state.busy);
+        assert!(state.message_is_error);
+        assert_eq!(
+            state.pending, staged,
+            "a failed Apply keeps the staged change"
+        );
+        let status = state.status.clone();
+        let list = state.list.clone();
+        state.busy = true;
+        finish_apply(&mut state, Ok((status, list)));
+        assert!(state.pending.is_empty());
+        assert!(!state.busy);
     }
 
     #[test]
