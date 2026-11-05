@@ -6,6 +6,7 @@
 
 mod backend;
 mod import;
+mod keyboard;
 mod screens;
 mod text;
 mod theme;

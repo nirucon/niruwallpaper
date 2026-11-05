@@ -23,6 +23,7 @@ use x11rb::{
 };
 
 use crate::backend::{self, Change, Status, Wallpaper};
+use crate::keyboard;
 use crate::screens::{self, Screen};
 use crate::theme::{self, Palette};
 use crate::thumbs;
@@ -1796,6 +1797,8 @@ impl ApplyJob {
 /// point, so one table serves every layout.
 const K_ESCAPE: u32 = 0xff1b;
 const K_TAB: u32 = 0xff09;
+/// Shift+Tab on most layouts.
+const K_ISO_LEFT_TAB: u32 = 0xfe20;
 const K_RETURN: u32 = 0xff0d;
 const K_LEFT: u32 = 0xff51;
 const K_UP: u32 = 0xff52;
@@ -1814,11 +1817,12 @@ const K_F1: u32 = 0xffbe;
 
 /// Keycode-to-keysym table for the connected keyboard.
 ///
-/// Built once from the server's mapping so a keypress resolves to the same
-/// keysym on a US and a Swedish layout.
+/// Every level of each key is kept, so a keypress resolves through the
+/// shared Shift/AltGr/Caps Lock helpers to the symbol the layout really
+/// produces. The table is read again when the keyboard mapping changes.
 pub struct Keys {
-    /// Keysym for each keycode, indexed from `min`.
-    table: Vec<u32>,
+    /// The keysyms of each keycode, indexed from `min`.
+    table: Vec<Vec<u32>>,
     min: u8,
 }
 
@@ -1832,23 +1836,18 @@ impl Keys {
             .reply()
             .map_err(|e| e.to_string())?;
         let per = map.keysyms_per_keycode.max(1) as usize;
-        // The first level of each key is the unshifted character, which is what
-        // navigation and letter shortcuts need.
-        let table = map
-            .keysyms
-            .chunks(per)
-            .map(|syms| syms.first().copied().unwrap_or(0))
-            .collect();
+        let table = map.keysyms.chunks(per).map(<[u32]>::to_vec).collect();
         Ok(Self {
             table,
             min: setup.min_keycode,
         })
     }
 
-    pub fn sym(&self, code: u8) -> u32 {
+    /// The keysym this keycode produces with these modifiers.
+    pub fn sym(&self, code: u8, state: KeyButMask) -> u32 {
         code.checked_sub(self.min)
             .and_then(|i| self.table.get(i as usize))
-            .copied()
+            .map(|syms| keyboard::keyboard_symbol(syms, state))
             .unwrap_or(0)
     }
 }
@@ -2142,11 +2141,7 @@ fn handle_event(
     event: Event,
 ) -> Result<Flow, String> {
     match event {
-        Event::Expose(e) => {
-            if e.count == 0 {
-                ui.dirty = true;
-            }
-        }
+        Event::Expose(e) if e.count == 0 => ui.dirty = true,
         Event::ConfigureNotify(e) => {
             if e.width != app.w || e.height != app.h {
                 app.w = e.width.max(MIN_WIDTH);
@@ -2157,21 +2152,21 @@ fn handle_event(
         }
         // Coming back to the window is when a change made elsewhere is
         // most likely; grabs (a window manager shortcut) are not a return.
-        Event::FocusIn(e) => {
-            if e.mode == NotifyMode::NORMAL && e.detail != NotifyDetail::POINTER {
-                app.debounce.note(Instant::now());
-            }
+        Event::FocusIn(e) if e.mode == NotifyMode::NORMAL && e.detail != NotifyDetail::POINTER => {
+            app.debounce.note(Instant::now());
         }
-        Event::PropertyNotify(e) => {
-            if e.window == app.root && e.atom == atom_id(&app.atoms, WALLPAPER_STATE) {
-                // NIRUWM published what it rendered.
-                app.debounce.note(Instant::now());
-            }
+        // NIRUWM published what it rendered.
+        Event::PropertyNotify(e)
+            if e.window == app.root && e.atom == atom_id(&app.atoms, WALLPAPER_STATE) =>
+        {
+            app.debounce.note(Instant::now());
         }
         Event::KeyPress(e) => {
             ui.dirty = true;
             let l = layout(app.w, app.h);
-            let key = app.keys.sym(e.detail);
+            // Shortcuts compare letters in lower case, so Caps Lock and
+            // Shift do not change which shortcut a key is.
+            let key = keyboard::shortcut(app.keys.sym(e.detail, e.state));
             // Ctrl+D discards; plain D moves focus back. Neither
             // shadows the plain letters people already use here.
             let ctrl = e.state.contains(KeyButMask::CONTROL);
@@ -2189,7 +2184,7 @@ fn handle_event(
                 ui.focus = None;
                 return Ok(Flow::Continue);
             }
-            if e.state.contains(KeyButMask::SHIFT) && key == K_TAB {
+            if key == K_ISO_LEFT_TAB || e.state.contains(KeyButMask::SHIFT) && key == K_TAB {
                 ui.focus = move_focus(state, ui.focus, false);
                 return Ok(Flow::Continue);
             }
@@ -2261,6 +2256,10 @@ fn handle_event(
         }
         Event::RandrScreenChangeNotify(_) => {
             app.screens_dirty = true;
+        }
+        // A new layout (setxkbmap, a plugged-in keyboard).
+        Event::MappingNotify(e) if e.request == Mapping::KEYBOARD => {
+            app.keys = Keys::new(&app.c)?;
         }
         _ => {}
     }
