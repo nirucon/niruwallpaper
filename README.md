@@ -24,9 +24,20 @@ the window manager about what is shown.
   picture from the installed set.
 - **Choose your own picture** — any picture in `~/Pictures/Wallpapers` (or the
   directory configured in `niruwm/config.toml`).
-- **Set one screen alone** — with more than one screen, the header lists
-  *All screens* and each connected screen. A screen that is set alone keeps its
-  picture while every other screen follows the shared settings and the theme.
+- **Add pictures** — under **My wallpapers**, *Add pictures…* lists the PNG,
+  JPEG, WebP and BMP files directly in your Pictures and Downloads folders
+  (localized names from `user-dirs.dirs` included), newest first. Mark any
+  number and they are **copied** into the wallpaper directory; the originals
+  are never moved, and a name that is taken gets `-2`, `-3`, … before the
+  extension. *Open folder* opens the wallpaper directory with `xdg-open`.
+- **Set one screen alone** — with more than one screen, the header shows
+  *All screens* and a small map of the screens as they are arranged. Click a
+  screen to set it alone; a corner mark shows the screens that have their own
+  picture. A screen that is set alone keeps its picture while every other
+  screen follows the shared settings and the theme.
+- **See the scale before applying** — the settings panel previews the staged
+  picture on the chosen screen's shape, placed the way `fill`, `fit`,
+  `stretch` or `center` would place it.
 
 It also sets the scale (`fill`, `fit`, `stretch`, `center`) and the rotation
 interval, including off.
@@ -55,19 +66,32 @@ These are the rules the window shows and NIRUWM enforces:
 - A single picture (`mode = "single"`) keeps one image, so rotation is
   explained as inactive instead of silently doing nothing.
 
-The window refreshes itself about once a second and follows the active theme
-live, including `appearance.toml` overrides. A staged, unapplied change is
-never replaced by a refresh; the footer says when the desktop changed
-meanwhile.
+The window does not poll. It watches (with inotify) the files `niructl` reads
+to answer — `~/.config/niruwm/config.toml`, `appearance.toml` and `themes/`,
+the wallpaper directory and the theme wallpaper directories — and reads the
+desktop again 300 ms after a change. It also does so when it gets the focus
+back, when a monitor is plugged in or out, and when NIRUWM publishes what it
+rendered. An idle window starts no process and does not wake up. It follows
+the active theme live, including `appearance.toml` overrides. A staged,
+unapplied change is never replaced by a refresh; the footer says when the
+desktop changed meanwhile.
+
+**Apply** runs in the background: the window says "Applying…" and keeps
+answering while NIRUWM composes each screen (seconds for an 8K picture on
+several monitors). The controls that change the staged settings wait until it
+is done. `niructl` gets 30 seconds for an Apply and 10 for a question; a
+command that does not answer by then is stopped and the staged change is kept.
 
 ## Previews
 
-Previews are made by a small number of background workers, visible tiles
-first, so a folder of 8K pictures never blocks the window. Each preview is kept
-in memory and in `$XDG_CACHE_HOME/niruwallpaper/thumbs-v2`, keyed on the file's
-path, size, modification time and a sample of its content, so a replaced file
-never shows a stale picture. PNG, JPEG, WebP and BMP are previewed; anything
-else, and a corrupt or missing file, shows a placeholder.
+Previews are made by a small number of background workers for every row in
+view (a partly visible one included) and one row ahead, so a folder of 8K
+pictures never blocks the window. Recently used previews are kept in memory
+(least recently used dropped first) and in
+`$XDG_CACHE_HOME/niruwallpaper/thumbs-v2`, keyed on the file's path, size,
+modification time and a sample of its content, so a replaced file never shows
+a stale picture. PNG, JPEG, WebP and BMP are previewed; anything else, and a
+corrupt or missing file, says "cannot read image".
 
 ## Usage
 
@@ -85,6 +109,7 @@ In the window:
 |---|---|
 | `Tab` / `Shift+Tab` | move between every control; the focus ring shows where you are |
 | arrows | choose a picture in the grid |
+| `PageUp` / `PageDown`, `Home` / `End` | move a page, or to the first or last picture |
 | `Space` | choose the picture, or press the focused control |
 | `Enter` | apply, or press the focused control |
 | `Ctrl+D` | discard the staged change |
@@ -92,9 +117,19 @@ In the window:
 | `F1` | help |
 | `Esc` or `q` | close |
 
+The mouse wheel scrolls the grid by a row (with `Shift`, by a page); it never
+chooses a picture. Only the left button presses controls. Above the grid,
+"Wallpapers 1–16 of 24" says where you are, and the thin scrollbar at the
+grid's edge can be dragged or clicked.
+
 The status line names the screen and picture each connected screen shows, and
 says when no running window manager confirmed the result. Clicking works for
 every control.
+
+The window paints for the size it is given. Narrower than 660 pixels (a tiled
+column), the settings panel moves below the grid. Keys work on every keyboard
+layout, with Shift, AltGr and Caps Lock resolved as in NIRU Launcher, and a
+layout change is picked up at once.
 
 ## Building
 
@@ -104,6 +139,8 @@ Rust 1.85 or newer.
 cargo build --release --locked
 cargo test --locked
 sh tests/cli-smoke.sh target/release/niruwallpaper
+# The window under Xvfb against a fixture niructl (needs Xvfb, xdotool, xwd):
+cargo test --locked --test xvfb -- --ignored
 ```
 
 The dependencies are the ones the suite already uses: `x11rb` for the X
@@ -122,7 +159,11 @@ also carries the desktop entry and icon, which NIRUX installs unchanged.
 | `~/.config/niruwm/config.toml` | Every setting, written only by `niructl` |
 | `$XDG_CACHE_HOME/niruwallpaper/thumbs-v2` | Regenerable preview cache |
 
-The program never modifies or deletes an image.
+The program never modifies, moves or deletes an image. *Add pictures* only
+adds copies to the wallpaper directory.
+
+`NIRUWALLPAPER_NIRUCTL=/path/to/niructl` makes the window use that `niructl`
+instead of the installed one (the Xvfb test uses it).
 
 ## Troubleshooting
 
