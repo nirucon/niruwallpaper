@@ -46,6 +46,10 @@ const PANEL_W: i16 = 300;
 const FOOTER: i16 = 86;
 /// Space between the bottom of the grid and the status line.
 const GRID_GAP: i16 = 4;
+/// The settings panel's height when it sits below the grid.
+const PANEL_COMPACT_H: i16 = 460;
+/// Width kept free at the grid's right edge for the scrollbar.
+const SCROLLBAR_ROOM: i16 = 20;
 
 /// The root window property NIRUWM publishes its rendered state in.
 const WALLPAPER_STATE: &str = "_NIRUWM_WALLPAPER_STATE";
@@ -968,9 +972,14 @@ impl App {
             )?;
         }
 
-        self.clip(None)?;
-
+        // The panel is clipped above the status line too, for a window
+        // that is shorter than the layout wants.
+        self.clip(Some(Rectangle {
+            height: (l.footer - l.panel.y).clamp(0, l.panel.height as i16) as u16,
+            ..l.panel
+        }))?;
         self.paint_panel(state, &l, focus)?;
+        self.clip(None)?;
 
         if let Some(hit) = focus {
             if let Some(rect) = hit_rect(&l, hit, state) {
@@ -1001,7 +1010,14 @@ impl App {
         self.label(
             PAD,
             l.footer + 26,
-            "Tab move  arrows select  Space choose  Enter apply  Ctrl+D discard  F1 help  Esc/q close",
+            &truncate(
+                if l.compact {
+                    "Tab move  Space choose  Enter apply  F1 help  Esc close"
+                } else {
+                    "Tab move  arrows select  Space choose  Enter apply  Ctrl+D discard  F1 help  Esc/q close"
+                },
+                (self.w as usize / 7).saturating_sub(2),
+            ),
             self.palette.muted,
             11.0,
         )?;
@@ -1383,6 +1399,9 @@ pub struct Layout {
     pub left: Rectangle,
     pub panel: Rectangle,
     pub footer: i16,
+    /// True when the window is too narrow for the panel beside the grid,
+    /// and it sits below the grid instead.
+    pub compact: bool,
     pub tiles_per_row: usize,
     pub visible_rows: usize,
     pub tabs: (Rectangle, Rectangle),
@@ -1391,30 +1410,60 @@ pub struct Layout {
 }
 
 pub fn layout(w: u16, h: u16) -> Layout {
-    let w = i16::try_from(w).unwrap_or(1000);
-    let h = i16::try_from(h).unwrap_or(690);
-    let list_w = w - PAD * 3 - PANEL_W;
+    let w = i16::try_from(w).unwrap_or(i16::MAX).max(1);
+    let h = i16::try_from(h).unwrap_or(i16::MAX).max(1);
     let top = HEADER + ROW;
-    let footer = h - FOOTER;
-    let tiles_per_row = ((list_w / TILE_W).max(1)) as usize;
-    // The grid ends a little above the status line, and only rows that fit
-    // completely count as visible; a partly visible row is clipped.
-    let grid_h = (footer - top - GRID_GAP).max(1);
-    let visible_rows = ((grid_h - 8) / TILE_H).max(1) as usize;
+    let footer = (h - FOOTER).max(top + 1);
+    // Below the width the side-by-side layout needs (a narrow tiled column),
+    // the settings panel moves below the grid instead of being cut off.
+    let compact = w < MIN_WIDTH as i16;
+    let (left, panel) = if compact {
+        let width = (w - PAD * 2).max(1);
+        let panel_h = PANEL_COMPACT_H;
+        let grid_h = (footer - top - GRID_GAP - panel_h - GRID_GAP).max(TILE_H + 8);
+        (
+            Rectangle {
+                x: PAD,
+                y: top,
+                width: width as u16,
+                height: grid_h as u16,
+            },
+            Rectangle {
+                x: PAD,
+                y: top + grid_h + GRID_GAP,
+                width: width as u16,
+                height: panel_h as u16,
+            },
+        )
+    } else {
+        let list_w = w - PAD * 3 - PANEL_W;
+        // The grid ends a little above the status line, and only rows that
+        // fit completely count as visible; a partly visible row is clipped.
+        let grid_h = (footer - top - GRID_GAP).max(1);
+        (
+            Rectangle {
+                x: PAD,
+                y: top,
+                width: (list_w + PAD).max(1) as u16,
+                height: grid_h as u16,
+            },
+            Rectangle {
+                x: w - PAD - PANEL_W,
+                y: HEADER - 20,
+                width: PANEL_W as u16,
+                height: (footer - HEADER + 20).max(1) as u16,
+            },
+        )
+    };
+    // Room for the scrollbar at the grid's right edge.
+    let tiles_w = left.width as i16 - SCROLLBAR_ROOM;
+    let tiles_per_row = (tiles_w / TILE_W).max(1) as usize;
+    let visible_rows = ((left.height as i16 - 8) / TILE_H).max(1) as usize;
     Layout {
-        left: Rectangle {
-            x: PAD,
-            y: top,
-            width: (list_w + PAD).max(1) as u16,
-            height: grid_h as u16,
-        },
-        panel: Rectangle {
-            x: w - PAD - PANEL_W,
-            y: HEADER - 20,
-            width: PANEL_W as u16,
-            height: (footer - HEADER + 20).max(1) as u16,
-        },
+        left,
+        panel,
         footer,
+        compact,
         tiles_per_row,
         visible_rows,
         tabs: (
@@ -1590,7 +1639,7 @@ fn follow_rect(l: &Layout) -> Rectangle {
     Rectangle {
         x: l.panel.x + 12,
         y: l.panel.y + 250,
-        width: PANEL_W as u16 - 24,
+        width: l.panel.width.saturating_sub(24),
         height: 28,
     }
 }
@@ -1599,7 +1648,7 @@ fn settings_rect(l: &Layout) -> Rectangle {
     Rectangle {
         x: l.panel.x + 12,
         y: l.panel.y + 40,
-        width: PANEL_W as u16 - 24,
+        width: l.panel.width.saturating_sub(24),
         height: 28,
     }
 }
@@ -1608,7 +1657,7 @@ fn apply_rect(l: &Layout) -> Rectangle {
     Rectangle {
         x: l.panel.x + 12,
         y: l.panel.y + l.panel.height as i16 - 96,
-        width: PANEL_W as u16 - 24,
+        width: l.panel.width.saturating_sub(24),
         height: 36,
     }
 }
@@ -1617,7 +1666,7 @@ fn cancel_rect(l: &Layout) -> Rectangle {
     Rectangle {
         x: l.panel.x + 12,
         y: l.panel.y + l.panel.height as i16 - 52,
-        width: PANEL_W as u16 - 24,
+        width: l.panel.width.saturating_sub(24),
         height: 32,
     }
 }
@@ -2095,6 +2144,10 @@ pub fn run(app: &mut App, state: &mut State, _palette: Palette) -> Result<(), St
             ui.dirty = true;
         }
         if ui.dirty {
+            // A resize or a shorter list can leave the grid scrolled past
+            // its end.
+            let l = layout(app.w, app.h);
+            state.scroll = state.scroll.min(max_scroll(state, &l));
             app.palette = state.palette;
             if ui.help {
                 paint_help(app)?;
@@ -2144,8 +2197,10 @@ fn handle_event(
         Event::Expose(e) if e.count == 0 => ui.dirty = true,
         Event::ConfigureNotify(e) => {
             if e.width != app.w || e.height != app.h {
-                app.w = e.width.max(MIN_WIDTH);
-                app.h = e.height.max(MIN_HEIGHT);
+                // Paint for the real size: a tiling window manager may give
+                // less than the size hints ask for.
+                app.w = e.width.max(1);
+                app.h = e.height.max(1);
                 app.resize_backing()?;
                 ui.dirty = true;
             }
@@ -2598,7 +2653,12 @@ mod tests {
     #[test]
     fn the_grid_is_clipped_above_the_status_line() {
         let state = fixture(30);
-        for (w, h) in [(MIN_WIDTH, MIN_HEIGHT), (WIDTH, HEIGHT), (1600, 1200)] {
+        for (w, h) in [
+            (MIN_WIDTH, MIN_HEIGHT),
+            (WIDTH, HEIGHT),
+            (1600, 1200),
+            (420, 1000),
+        ] {
             let l = layout(w, h);
             let grid_bottom = l.left.y + l.left.height as i16;
             assert!(
@@ -2625,6 +2685,49 @@ mod tests {
         }
         // The default size shows three full rows, as the window always did.
         assert_eq!(layout(WIDTH, HEIGHT).visible_rows, 3);
+    }
+
+    #[test]
+    fn a_narrow_window_puts_the_panel_below_the_grid() {
+        let state = fixture(30);
+        let wide = layout(WIDTH, HEIGHT);
+        assert!(!wide.compact);
+        assert!(wide.panel.x >= wide.left.x + wide.left.width as i16);
+        for (w, h) in [(420u16, 1000u16), (600, 1300)] {
+            let l = layout(w, h);
+            assert!(l.compact, "{w}x{h}");
+            assert!(l.panel.y >= l.left.y + l.left.height as i16, "{w}x{h}");
+            assert!(l.panel.y + l.panel.height as i16 <= l.footer, "{w}x{h}");
+            assert!(l.left.x + l.left.width as i16 <= w as i16 - PAD);
+            assert!(l.panel.x + l.panel.width as i16 <= w as i16 - PAD);
+            assert!(l.tiles_per_row >= 2, "{w}x{h}: {}", l.tiles_per_row);
+            // Every panel control is inside the panel, and the controls are
+            // still found by a click.
+            for control in [
+                Hit::Scale(0),
+                Hit::Scale(3),
+                Hit::Rotation(4),
+                Hit::FollowTheme,
+                Hit::ScreenFollow,
+                Hit::Apply,
+                Hit::Cancel,
+            ] {
+                let r = hit_rect(&l, control, &state).unwrap();
+                assert!(
+                    r.y >= l.panel.y
+                        && r.y + r.height as i16 <= l.panel.y + l.panel.height as i16
+                        && r.x + r.width as i16 <= l.panel.x + l.panel.width as i16,
+                    "{w}x{h}: {control:?} at {r:?} is outside the panel {:?}",
+                    l.panel
+                );
+                assert_eq!(hit(w, h, r.x + 2, r.y + 2, &state), Some(control));
+            }
+        }
+        // Smaller than anything sensible still lays out without panicking.
+        for (w, h) in [(1u16, 1u16), (200, 150), (MIN_WIDTH - 1, 300)] {
+            let l = layout(w, h);
+            assert!(l.tiles_per_row >= 1 && l.visible_rows >= 1);
+        }
     }
 
     #[test]
