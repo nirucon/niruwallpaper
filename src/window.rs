@@ -23,6 +23,7 @@ use x11rb::{
 };
 
 use crate::backend::{self, Change, Status, Wallpaper};
+use crate::import;
 use crate::keyboard;
 use crate::preview;
 use crate::screens::{self, Screen};
@@ -425,6 +426,9 @@ pub struct App {
     apply_job: ApplyJob,
     apply_done: Sender<(u64, ApplyResult)>,
     apply_results: Receiver<(u64, ApplyResult)>,
+    /// Copies made by "Add pictures" come back on this channel.
+    import_done: Sender<Vec<Result<PathBuf, String>>>,
+    import_results: Receiver<Vec<Result<PathBuf, String>>>,
     /// True when a monitor configuration change was seen; the screens are
     /// then re-read from RandR without waiting for the next refresh.
     screens_dirty: bool,
@@ -568,6 +572,7 @@ impl App {
         let (done, results) = mpsc::channel::<(u64, Thumb)>();
         spawn_workers(work, done, wake.clone());
         let (apply_done, apply_results) = mpsc::channel::<(u64, ApplyResult)>();
+        let (import_done, import_results) = mpsc::channel();
 
         Ok(Self {
             c,
@@ -597,6 +602,8 @@ impl App {
             apply_job: ApplyJob::default(),
             apply_done,
             apply_results,
+            import_done,
+            import_results,
             screens_dirty: false,
         })
     }
@@ -979,13 +986,19 @@ impl App {
             )?;
         }
         self.clip(None)?;
+        let buttons = mine_buttons(&l, state);
+        let label_room = buttons.map_or(l.left.width as i16, |(add, _)| add.x - l.left.x - 16);
         self.label(
             l.left.x + 8,
             l.left.y - 24,
-            &position_label(&l, state),
+            &truncate(&position_label(&l, state), (label_room / 7).max(0) as usize),
             self.palette.muted,
             12.0,
         )?;
+        if let Some((add, open)) = buttons {
+            self.button(add, "Add pictures\u{2026}", false, !state.busy)?;
+            self.button(open, "Open folder", false, true)?;
+        }
         if let Some((track, thumb)) = scrollbar(&l, state) {
             self.fill(self.palette.surface, track)?;
             self.fill(
@@ -1538,6 +1551,10 @@ pub enum Hit {
     Cancel,
     /// The grid's scrollbar track.
     Scrollbar,
+    /// "Add pictures…" under My wallpapers.
+    AddPictures,
+    /// "Open folder" under My wallpapers.
+    OpenFolder,
 }
 
 /// The layout for one window size.
@@ -1644,6 +1661,8 @@ pub fn hit_rect(l: &Layout, hit: Hit, state: &State) -> Option<Rectangle> {
         Hit::Apply => apply_rect(l),
         Hit::Cancel => cancel_rect(l),
         Hit::Scrollbar => scrollbar(l, state)?.0,
+        Hit::AddPictures => mine_buttons(l, state)?.0,
+        Hit::OpenFolder => mine_buttons(l, state)?.1,
     })
 }
 
@@ -1667,6 +1686,14 @@ pub fn hit(w: u16, h: u16, x: i16, y: i16, state: &State) -> Option<Hit> {
         }
     }
     // Tiles, in the order they are painted.
+    if let Some((add, open)) = mine_buttons(&l, state) {
+        if inside(add, x, y) {
+            return Some(Hit::AddPictures);
+        }
+        if inside(open, x, y) {
+            return Some(Hit::OpenFolder);
+        }
+    }
     if let Some((track, _)) = scrollbar(&l, state) {
         // A little wider than it is drawn, so it is easy to take.
         let grab = Rectangle {
@@ -2122,6 +2149,9 @@ impl Keys {
 /// The order Tab moves through, so every control is keyboard reachable.
 pub fn focus_order(state: &State) -> Vec<Hit> {
     let mut out = vec![Hit::Tab(Tab::Official), Hit::Tab(Tab::Mine)];
+    if state.tab == Tab::Mine {
+        out.extend([Hit::AddPictures, Hit::OpenFolder]);
+    }
     if state.multi_screen() {
         for i in 0..targets(state).len() {
             out.push(Hit::Screen(i as u8));
@@ -2371,6 +2401,8 @@ pub fn help_lines() -> Vec<&'static str> {
         "A                  return to the picture grid",
         "F1                 show or hide this help",
         "Esc or q           close the window",
+        "PageUp/PageDown    move a page; Home/End to the first or last",
+        "Add pictures       copy pictures from Pictures or Downloads",
         "A screen name      limits every change to that screen",
         "All screens        changes the picture every screen inherits",
     ]
@@ -2383,6 +2415,8 @@ struct Ui {
     help: bool,
     /// While the scrollbar is dragged: where in the thumb it was taken.
     drag: Option<i16>,
+    /// The "Add pictures" list, while it is open.
+    import: Option<ImportView>,
     dirty: bool,
 }
 
@@ -2429,6 +2463,9 @@ pub fn run(app: &mut App, state: &mut State, _palette: Palette) -> Result<(), St
         if collect_apply(app, state) {
             ui.dirty = true;
         }
+        if collect_import(app, state, &mut ui.import) {
+            ui.dirty = true;
+        }
         if app.watcher.drain() {
             app.debounce.note(Instant::now());
         }
@@ -2451,6 +2488,8 @@ pub fn run(app: &mut App, state: &mut State, _palette: Palette) -> Result<(), St
             app.palette = state.palette;
             if ui.help {
                 paint_help(app)?;
+            } else if let Some(view) = &ui.import {
+                paint_import(app, view)?;
             } else {
                 app.paint(state, ui.focus, ui.drag.is_some())?;
             }
@@ -2539,6 +2578,14 @@ fn handle_event(
                 ui.focus = None;
                 return Ok(Flow::Continue);
             }
+            if let Some(view) = ui.import.as_mut() {
+                match import_key(view, key, &import_layout(app.w, app.h)) {
+                    ImportAction::Copy => start_import(app, view),
+                    ImportAction::Close => ui.import = None,
+                    ImportAction::None => {}
+                }
+                return Ok(Flow::Continue);
+            }
             if key == K_ISO_LEFT_TAB || e.state.contains(KeyButMask::SHIFT) && key == K_TAB {
                 ui.focus = move_focus(state, ui.focus, false);
                 return Ok(Flow::Continue);
@@ -2551,17 +2598,32 @@ fn handle_event(
                 }
                 KeyAction::Select => select_current(state),
                 KeyAction::Discard => activate(state, Hit::Cancel),
-                KeyAction::Activate(Hit::Apply) => {
-                    run_apply(app, state);
-                    ui.focus = None;
-                }
-                KeyAction::Activate(control) => activate(state, control),
+                KeyAction::Activate(control) => press(app, state, ui, control),
                 KeyAction::Focus(next) => ui.focus = next,
                 KeyAction::Help => {
                     ui.help = true;
                     ui.focus = None;
                 }
                 KeyAction::Redraw | KeyAction::None => {}
+            }
+        }
+        Event::ButtonPress(e) if ui.import.is_some() => {
+            ui.dirty = true;
+            let il = import_layout(app.w, app.h);
+            let Some(view) = ui.import.as_mut() else {
+                return Ok(Flow::Continue);
+            };
+            let at = import_hit(&il, view, e.event_x, e.event_y);
+            match (e.detail, at) {
+                (4, _) => import_scroll(view, &il, -3),
+                (5, _) => import_scroll(view, &il, 3),
+                (1, Some(ImportHit::Row(i))) => {
+                    view.cursor = i;
+                    view.toggle(i);
+                }
+                (1, Some(ImportHit::Copy)) => start_import(app, view),
+                (1, Some(ImportHit::Cancel)) if !view.copying => ui.import = None,
+                _ => {}
             }
         }
         Event::ButtonPress(e) => {
@@ -2598,18 +2660,10 @@ fn handle_event(
                     select_current(state);
                     ui.focus = None;
                 }
-                Some(Hit::Apply) => {
-                    run_apply(app, state);
-                    ui.focus = None;
-                }
-                Some(Hit::Cancel) => {
-                    activate(state, Hit::Cancel);
-                    ui.focus = None;
-                }
                 Some(control) => {
-                    // A click on a setting changes it once, the same
-                    // as pressing Space on it.
-                    activate(state, control);
+                    // A click on a control presses it once, the same as
+                    // Space or Enter on it.
+                    press(app, state, ui, control);
                     ui.focus = None;
                 }
                 None => {}
@@ -2843,8 +2897,9 @@ fn activate(state: &mut State, control: Hit) {
             state.pending.scale = None;
             state.set_message("Stage: follow the shared settings", false);
         }
-        // Apply is run by the caller; the scrollbar is dragged, not pressed.
-        Hit::Apply | Hit::Scrollbar => {}
+        // These need the window and are run by `press`; the scrollbar is
+        // dragged, not pressed.
+        Hit::Apply | Hit::Scrollbar | Hit::AddPictures | Hit::OpenFolder => {}
         Hit::Cancel => {
             state.pending = Pending::default();
             state.set_message("Discarded staged changes", false);
@@ -2879,6 +2934,378 @@ fn request_visible_previews(app: &mut App, state: &State) {
     for path in paths {
         app.want_thumb(&path);
     }
+}
+
+/// "Add pictures…" and "Open folder", above the grid at its right edge,
+/// shown under My wallpapers only.
+pub fn mine_buttons(l: &Layout, state: &State) -> Option<(Rectangle, Rectangle)> {
+    if state.tab != Tab::Mine {
+        return None;
+    }
+    // Right-aligned with the last column of tiles.
+    let right = l.left.x + l.tiles_per_row as i16 * TILE_W;
+    let y = l.left.y - 30;
+    let open = Rectangle {
+        x: right - 104,
+        y,
+        width: 104,
+        height: 24,
+    };
+    let add = Rectangle {
+        x: open.x - 8 - 124,
+        y,
+        width: 124,
+        height: 24,
+    };
+    Some((add, open))
+}
+
+/// The configured wallpaper directory, where added pictures go.
+pub fn wallpaper_dir(state: &State) -> PathBuf {
+    let dir = if state.status.dir.trim().is_empty() {
+        "~/Pictures/Wallpapers"
+    } else {
+        state.status.dir.as_str()
+    };
+    PathBuf::from(backend::expand_home(dir))
+}
+
+/// Press one control: the same for a click and for Space or Enter on it.
+fn press(app: &mut App, state: &mut State, ui: &mut Ui, control: Hit) {
+    match control {
+        Hit::Apply => {
+            run_apply(app, state);
+            ui.focus = None;
+        }
+        Hit::AddPictures if !state.busy => {
+            let dir = wallpaper_dir(state);
+            let items = import::candidates(&import::source_dirs(), &dir);
+            ui.import = Some(ImportView::new(items, dir));
+        }
+        Hit::OpenFolder => {
+            let dir = wallpaper_dir(state);
+            match open_folder(&dir) {
+                Ok(()) => state.set_message(format!("Opened {}", dir.display()), false),
+                Err(err) => state.set_message(err, true),
+            }
+        }
+        control => activate(state, control),
+    }
+}
+
+/// Show a folder in the file manager through `xdg-open`, without waiting.
+fn open_folder(dir: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    let mut child = std::process::Command::new("xdg-open")
+        .arg(dir)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| format!("cannot run xdg-open: {e}"))?;
+    // Reap it whenever it ends, so no zombie stays behind.
+    thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(())
+}
+
+/// The "Add pictures" list: pictures from Pictures and Downloads, any number
+/// of which are marked and then copied into the wallpaper directory.
+#[derive(Debug)]
+pub struct ImportView {
+    pub items: Vec<import::Candidate>,
+    pub marked: Vec<bool>,
+    pub cursor: usize,
+    pub scroll: usize,
+    /// Where the copies go.
+    pub dir: PathBuf,
+    /// True while the copies are made.
+    pub copying: bool,
+    pub message: String,
+}
+
+impl ImportView {
+    pub fn new(items: Vec<import::Candidate>, dir: PathBuf) -> Self {
+        let marked = vec![false; items.len()];
+        Self {
+            items,
+            marked,
+            cursor: 0,
+            scroll: 0,
+            dir,
+            copying: false,
+            message: String::new(),
+        }
+    }
+
+    pub fn toggle(&mut self, i: usize) {
+        if let Some(mark) = self.marked.get_mut(i) {
+            *mark = !*mark;
+        }
+    }
+
+    /// The pictures to copy: the marked ones, or the one under the cursor
+    /// when none is marked.
+    pub fn chosen(&self) -> Vec<PathBuf> {
+        let marked: Vec<PathBuf> = self
+            .items
+            .iter()
+            .zip(&self.marked)
+            .filter(|(_, m)| **m)
+            .map(|(c, _)| c.path.clone())
+            .collect();
+        if marked.is_empty() {
+            self.items
+                .get(self.cursor)
+                .map(|c| vec![c.path.clone()])
+                .unwrap_or_default()
+        } else {
+            marked
+        }
+    }
+}
+
+/// Where the parts of the "Add pictures" view are.
+pub struct ImportLayout {
+    pub list: Rectangle,
+    pub rows: usize,
+    pub copy: Rectangle,
+    pub cancel: Rectangle,
+}
+
+const IMPORT_ROW: i16 = 24;
+
+pub fn import_layout(w: u16, h: u16) -> ImportLayout {
+    let w = i16::try_from(w).unwrap_or(i16::MAX).max(1);
+    let h = i16::try_from(h).unwrap_or(i16::MAX).max(1);
+    let top = 96;
+    let bottom = (h - FOOTER - 44).max(top + IMPORT_ROW);
+    let list = Rectangle {
+        x: PAD,
+        y: top,
+        width: (w - PAD * 2).max(1) as u16,
+        height: (bottom - top) as u16,
+    };
+    ImportLayout {
+        list,
+        rows: ((bottom - top) / IMPORT_ROW).max(1) as usize,
+        copy: Rectangle {
+            x: PAD,
+            y: bottom + 8,
+            width: 200,
+            height: 30,
+        },
+        cancel: Rectangle {
+            x: PAD + 208,
+            y: bottom + 8,
+            width: 100,
+            height: 30,
+        },
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ImportHit {
+    Row(usize),
+    Copy,
+    Cancel,
+}
+
+pub fn import_hit(l: &ImportLayout, view: &ImportView, x: i16, y: i16) -> Option<ImportHit> {
+    if inside(l.copy, x, y) {
+        return Some(ImportHit::Copy);
+    }
+    if inside(l.cancel, x, y) {
+        return Some(ImportHit::Cancel);
+    }
+    if !inside(l.list, x, y) {
+        return None;
+    }
+    let i = view.scroll + ((y - l.list.y) / IMPORT_ROW) as usize;
+    (i < view.items.len()).then_some(ImportHit::Row(i))
+}
+
+pub fn import_scroll(view: &mut ImportView, l: &ImportLayout, rows: i32) {
+    let max = view.items.len().saturating_sub(l.rows) as i64;
+    view.scroll = (view.scroll as i64 + i64::from(rows)).clamp(0, max) as usize;
+}
+
+pub enum ImportAction {
+    None,
+    Copy,
+    Close,
+}
+
+/// Keys in the "Add pictures" view: arrows move, Space marks, Enter copies,
+/// Esc closes.
+pub fn import_key(view: &mut ImportView, key: u32, l: &ImportLayout) -> ImportAction {
+    let count = view.items.len();
+    let page = l.rows.max(1);
+    let last = count.saturating_sub(1);
+    match key {
+        K_ESCAPE | K_Q if !view.copying => return ImportAction::Close,
+        K_RETURN if !view.copying => return ImportAction::Copy,
+        K_SPACE => {
+            let i = view.cursor;
+            view.toggle(i);
+        }
+        K_DOWN | K_J => view.cursor = (view.cursor + 1).min(last),
+        K_UP | K_K => view.cursor = view.cursor.saturating_sub(1),
+        K_PAGE_DOWN => view.cursor = (view.cursor + page).min(last),
+        K_PAGE_UP => view.cursor = view.cursor.saturating_sub(page),
+        K_HOME => view.cursor = 0,
+        K_END => view.cursor = last,
+        _ => {}
+    }
+    if view.cursor < view.scroll {
+        view.scroll = view.cursor;
+    } else if view.cursor >= view.scroll + page {
+        view.scroll = view.cursor + 1 - page;
+    }
+    ImportAction::None
+}
+
+/// Copy the chosen pictures on a worker; the list stays open meanwhile.
+fn start_import(app: &App, view: &mut ImportView) {
+    let chosen = view.chosen();
+    if view.copying || chosen.is_empty() {
+        return;
+    }
+    view.copying = true;
+    view.message = format!("Copying {} picture(s)\u{2026}", chosen.len());
+    let dir = view.dir.clone();
+    let done = app.import_done.clone();
+    let wake = app.wake.clone();
+    thread::spawn(move || {
+        let results = chosen
+            .iter()
+            .map(|source| import::copy_into(source, &dir))
+            .collect();
+        let _ = done.send(results);
+        wake.notify();
+    });
+}
+
+/// Take the result of a finished copy: close the list, say what happened,
+/// and show My wallpapers, where the new pictures appear once the
+/// directory watch has refreshed the list.
+fn collect_import(app: &mut App, state: &mut State, view: &mut Option<ImportView>) -> bool {
+    let Ok(results) = app.import_results.try_recv() else {
+        return false;
+    };
+    let results: Vec<Result<PathBuf, String>> = results;
+    let added = results.iter().filter(|r| r.is_ok()).count();
+    let failed: Vec<&String> = results.iter().filter_map(|r| r.as_ref().err()).collect();
+    *view = None;
+    state.tab = Tab::Mine;
+    state.selected = 0;
+    state.scroll = 0;
+    match failed.first() {
+        Some(first) => state.set_message(
+            format!("Added {added}, {} failed: {first}", failed.len()),
+            true,
+        ),
+        None => state.set_message(
+            format!(
+                "Added {added} picture(s) to {}. Choose one below.",
+                wallpaper_dir(state).display()
+            ),
+            false,
+        ),
+    }
+    // The watch on the directory refreshes the list; asking now as well
+    // covers a directory that was only just created.
+    app.debounce.note(Instant::now());
+    true
+}
+
+/// The "Add pictures" view.
+fn paint_import(app: &App, view: &ImportView) -> Result<(), String> {
+    let l = import_layout(app.w, app.h);
+    app.fill(
+        app.palette.background,
+        Rectangle {
+            x: 0,
+            y: 0,
+            width: app.w,
+            height: app.h,
+        },
+    )?;
+    app.label(PAD, PAD - 8, "Add pictures", app.palette.foreground, 20.0)?;
+    app.label(
+        PAD,
+        PAD + 22,
+        &truncate(
+            &format!(
+                "From Pictures and Downloads, copied to {}. The originals stay where they are.",
+                view.dir.display()
+            ),
+            (app.w as usize / 7).saturating_sub(4),
+        ),
+        app.palette.muted,
+        12.0,
+    )?;
+    app.label(
+        PAD,
+        PAD + 44,
+        "Space marks a picture, Enter copies the marked ones (or the highlighted one), Esc closes",
+        app.palette.muted,
+        11.0,
+    )?;
+    app.fill(app.palette.surface, l.list)?;
+    if view.items.is_empty() {
+        app.label(
+            l.list.x + 8,
+            l.list.y + 8,
+            "No PNG, JPEG, WebP or BMP pictures in Pictures or Downloads.",
+            app.palette.muted,
+            12.0,
+        )?;
+    }
+    app.clip(Some(l.list))?;
+    for (row, i) in (view.scroll..view.items.len()).take(l.rows).enumerate() {
+        let item = &view.items[i];
+        let r = Rectangle {
+            x: l.list.x,
+            y: l.list.y + row as i16 * IMPORT_ROW,
+            width: l.list.width,
+            height: IMPORT_ROW as u16,
+        };
+        let (bg, fg) = if i == view.cursor {
+            (app.palette.accent, app.palette.background)
+        } else {
+            (app.palette.surface, app.palette.foreground)
+        };
+        app.fill(bg, r)?;
+        let mark = if view.marked[i] { "[x]" } else { "[ ]" };
+        let text = format!(
+            "{mark}  {}   {} \u{b7} {}",
+            item.name(),
+            item.folder,
+            import::human_size(item.bytes)
+        );
+        app.label_on(
+            r.x + 8,
+            r.y + 4,
+            &truncate(&text, (l.list.width as usize / 7).saturating_sub(2)),
+            fg,
+            bg,
+            12.0,
+        )?;
+    }
+    app.clip(None)?;
+    let count = view.chosen().len();
+    let enabled = count > 0 && !view.copying;
+    app.button(
+        l.copy,
+        &format!("Copy {count} picture{}", if count == 1 { "" } else { "s" }),
+        enabled,
+        enabled,
+    )?;
+    app.button(l.cancel, "Cancel", false, !view.copying)?;
+    app.label(PAD, l.copy.y + 40, &view.message, app.palette.muted, 12.0)?;
+    app.flush()
 }
 
 /// The help view: the same window, the controls on screen.
@@ -3258,6 +3685,78 @@ mod tests {
         assert!(frame.height >= 140, "{frame:?}");
         assert!(frame.y + frame.height as i16 <= apply_rect(&l).y);
         assert!(frame.y >= follow_rect(&l).y + 28 + 3 * 18);
+    }
+
+    #[test]
+    fn my_wallpapers_offers_add_pictures_and_open_folder() {
+        let mut state = fixture(4);
+        let l = layout(WIDTH, HEIGHT);
+        assert!(
+            mine_buttons(&l, &state).is_none(),
+            "only under My wallpapers"
+        );
+        state.tab = Tab::Mine;
+        let (add, open) = mine_buttons(&l, &state).unwrap();
+        assert_eq!(
+            hit(WIDTH, HEIGHT, add.x + 4, add.y + 4, &state),
+            Some(Hit::AddPictures)
+        );
+        assert_eq!(
+            hit(WIDTH, HEIGHT, open.x + 4, open.y + 4, &state),
+            Some(Hit::OpenFolder)
+        );
+        assert!(add.x + add.width as i16 <= open.x);
+        assert!(open.x + open.width as i16 <= l.left.x + l.left.width as i16);
+        assert!(focus_order(&state).contains(&Hit::AddPictures));
+        state.status.dir = "/srv/walls".into();
+        assert_eq!(wallpaper_dir(&state), PathBuf::from("/srv/walls"));
+    }
+
+    #[test]
+    fn the_import_list_marks_and_copies_the_chosen_pictures() {
+        let root = std::env::temp_dir().join(format!("nw-import-view-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let pictures = root.join("Pictures");
+        std::fs::create_dir_all(&pictures).unwrap();
+        for name in ["a.png", "b.jpg", "c.webp"] {
+            std::fs::write(pictures.join(name), name).unwrap();
+        }
+        let items = import::candidates(&[(pictures.clone(), "Pictures".into())], &root.join("W"));
+        let mut view = ImportView::new(items, root.join("W"));
+        let l = import_layout(WIDTH, HEIGHT);
+        // Nothing marked: Enter copies the highlighted picture.
+        assert_eq!(view.chosen().len(), 1);
+        import_key(&mut view, K_SPACE, &l);
+        import_key(&mut view, K_DOWN, &l);
+        import_key(&mut view, K_DOWN, &l);
+        import_key(&mut view, K_SPACE, &l);
+        assert_eq!(view.chosen().len(), 2);
+        assert!(matches!(
+            import_key(&mut view, K_RETURN, &l),
+            ImportAction::Copy
+        ));
+        for source in view.chosen() {
+            import::copy_into(&source, &view.dir).unwrap();
+        }
+        assert_eq!(std::fs::read_dir(&view.dir).unwrap().count(), 2);
+        assert_eq!(
+            std::fs::read_dir(&pictures).unwrap().count(),
+            3,
+            "originals stay"
+        );
+        // A click on a row is that row; the buttons are found too.
+        let row = import_hit(&l, &view, l.list.x + 10, l.list.y + IMPORT_ROW + 2);
+        assert_eq!(row, Some(ImportHit::Row(1)));
+        assert_eq!(
+            import_hit(&l, &view, l.copy.x + 2, l.copy.y + 2),
+            Some(ImportHit::Copy)
+        );
+        view.copying = true;
+        assert!(
+            matches!(import_key(&mut view, K_ESCAPE, &l), ImportAction::None),
+            "the list stays open while copying"
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
