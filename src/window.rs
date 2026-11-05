@@ -26,6 +26,7 @@ use crate::backend::{self, Change, Status, Wallpaper};
 use crate::screens::{self, Screen};
 use crate::theme::{self, Palette};
 use crate::thumbs;
+use crate::watch;
 
 pub const APP_ID: &str = "niruwallpaper";
 pub const APP_NAME: &str = "NIRU Wallpaper";
@@ -45,12 +46,8 @@ const FOOTER: i16 = 86;
 /// Space between the bottom of the grid and the status line.
 const GRID_GAP: i16 = 4;
 
-/// How often the window asks the desktop whether anything changed.
-///
-/// Five calls to a local program a second with no user interaction is cheap,
-/// and it is what a theme change, another program's edit or a monitor change
-/// needs to appear without a restart. Nothing is rendered unless it changed.
-const REFRESH: Duration = Duration::from_millis(1000);
+/// The root window property NIRUWM publishes its rendered state in.
+const WALLPAPER_STATE: &str = "_NIRUWM_WALLPAPER_STATE";
 
 /// Previews kept in memory: a few screens' worth of tiles at 320 pixels.
 const PREVIEW_CACHE: usize = 96;
@@ -344,12 +341,13 @@ fn check_screen(c: &RustConnection) -> Result<(), String> {
 }
 
 fn intern(c: &RustConnection) -> Result<Vec<(&'static str, u32)>, String> {
-    const NAMES: [&str; 5] = [
+    const NAMES: [&str; 6] = [
         "UTF8_STRING",
         "WM_PROTOCOLS",
         "WM_DELETE_WINDOW",
         "_NET_WM_NAME",
         "_NET_WM_WINDOW_TYPE",
+        WALLPAPER_STATE,
     ];
     let mut out = Vec::new();
     for name in NAMES {
@@ -409,9 +407,12 @@ pub struct App {
     requests: Sender<(u64, PathBuf)>,
     results: Receiver<(u64, Thumb)>,
     request_serial: u64,
-    /// The refresh timer restarts when a key or click happens, so it never
-    /// interrupts typing.
-    last_activity: Instant,
+    /// The files whose changes can change `niructl`'s answer.
+    watcher: watch::Watcher,
+    /// Debounces those changes into one refresh.
+    debounce: watch::Debounce,
+    /// Workers write here to wake the event loop.
+    wake: Arc<watch::Wake>,
     /// True when a monitor configuration change was seen; the screens are
     /// then re-read from RandR without waiting for the next refresh.
     screens_dirty: bool,
@@ -454,7 +455,8 @@ impl App {
                         | EventMask::KEY_PRESS
                         | EventMask::BUTTON_PRESS
                         | EventMask::POINTER_MOTION
-                        | EventMask::STRUCTURE_NOTIFY,
+                        | EventMask::STRUCTURE_NOTIFY
+                        | EventMask::FOCUS_CHANGE,
                 ),
         )
         .map_err(|e| e.to_string())?;
@@ -536,9 +538,20 @@ impl App {
         // its screens; a server without RandR keeps working without them.
         let _ = c.randr_select_input(root, x11rb::protocol::randr::NotifyMask::SCREEN_CHANGE);
 
+        // NIRUWM publishes what it rendered as a root window property; its
+        // change is the cue to look again, so the root's property changes
+        // are selected too.
+        c.change_window_attributes(
+            root,
+            &ChangeWindowAttributesAux::new().event_mask(EventMask::PROPERTY_CHANGE),
+        )
+        .map_err(|e| e.to_string())?;
+        let watcher = watch::Watcher::new()?;
+        let wake = Arc::new(watch::Wake::new()?);
+
         let (requests, work) = mpsc::channel::<(u64, PathBuf)>();
         let (done, results) = mpsc::channel::<(u64, Thumb)>();
-        spawn_workers(work, done);
+        spawn_workers(work, done, wake.clone());
 
         Ok(Self {
             c,
@@ -562,9 +575,19 @@ impl App {
             requests,
             results,
             request_serial: 0,
-            last_activity: Instant::now(),
+            watcher,
+            debounce: watch::Debounce::default(),
+            wake,
             screens_dirty: false,
         })
+    }
+
+    /// Watch the directories the current report names.
+    fn watch(&mut self, state: &State) {
+        self.watcher.set(watch::watched_dirs(
+            &state.status.dir,
+            &state.status.theme_dir,
+        ));
     }
 
     /// Re-read the screens from RandR. Returns true when they changed.
@@ -1136,11 +1159,16 @@ impl App {
 
 /// Two workers are enough for a list of previews; more only competes for the
 /// same disk and decoder. Each one exits when the window drops the sender.
-fn spawn_workers(work: Receiver<(u64, PathBuf)>, done: Sender<(u64, Thumb)>) {
+fn spawn_workers(
+    work: Receiver<(u64, PathBuf)>,
+    done: Sender<(u64, Thumb)>,
+    wake: Arc<watch::Wake>,
+) {
     let work = Arc::new(Mutex::new(work));
     for _ in 0..2 {
         let work = work.clone();
         let done = done.clone();
+        let wake = wake.clone();
         thread::spawn(move || {
             let take = |work: &Arc<Mutex<Receiver<(u64, PathBuf)>>>| {
                 work.lock().ok().and_then(|rx| rx.recv().ok())
@@ -1154,6 +1182,7 @@ fn spawn_workers(work: Receiver<(u64, PathBuf)>, done: Sender<(u64, Thumb)>) {
                 if done.send((serial, Thumb { path, image, stamp })).is_err() {
                     return;
                 }
+                wake.notify();
             }
         });
     }
@@ -1942,171 +1971,238 @@ pub fn help_lines() -> Vec<&'static str> {
     ]
 }
 
+/// What the event loop keeps between events besides the desktop state.
+#[derive(Default)]
+struct Ui {
+    focus: Option<Hit>,
+    help: bool,
+    dirty: bool,
+}
+
+/// Whether the window stays open after an event.
+#[derive(PartialEq, Eq)]
+enum Flow {
+    Continue,
+    Quit,
+}
+
 /// The event loop. Returns when the window is closed.
+///
+/// Nothing here runs on a timer. The loop sleeps in `poll` on the X
+/// connection, the inotify watch and the workers' wake-up pipe, with a
+/// timeout only while a debounced refresh is pending.
 pub fn run(app: &mut App, state: &mut State, _palette: Palette) -> Result<(), String> {
     // The window's own RandR list decides which screens exist, so the two
     // never disagree about a screen that was plugged in a moment ago.
     sync_screens(app, state);
-    let mut focus: Option<Hit> = None;
-    let mut help = false;
-    let mut dirty = true;
+    app.watch(state);
+    let mut ui = Ui {
+        dirty: true,
+        ..Ui::default()
+    };
     request_visible_previews(app, state);
+    let mut queued: Option<Event> = None;
     loop {
-        let mut handled = false;
-        while let Some(event) = app.c.poll_for_event().map_err(|e| e.to_string())? {
-            handled = true;
-            dirty = true;
-            let came_from_user = matches!(
-                event,
-                Event::KeyPress(_) | Event::ButtonPress(_) | Event::MotionNotify(_)
-            );
-            if came_from_user {
-                app.last_activity = Instant::now();
-            }
-            match event {
-                Event::Expose(e) if e.count == 0 => {}
-                Event::ConfigureNotify(e) => {
-                    if e.width != app.w || e.height != app.h {
-                        app.w = e.width.max(MIN_WIDTH);
-                        app.h = e.height.max(MIN_HEIGHT);
-                        app.resize_backing()?;
-                    }
-                }
-                Event::KeyPress(e) => {
-                    let l = layout(app.w, app.h);
-                    let key = app.keys.sym(e.detail);
-                    // Ctrl+D discards; plain D moves focus back. Neither
-                    // shadows the plain letters people already use here.
-                    let ctrl = e.state.contains(KeyButMask::CONTROL);
-                    if ctrl && key == K_D {
-                        state.pending = Pending::default();
-                        state.set_message("Discarded staged changes", false);
-                        focus = None;
-                        help = false;
-                        continue;
-                    }
-                    if help {
-                        help = false;
-                        focus = None;
-                        continue;
-                    }
-                    if e.state.contains(KeyButMask::SHIFT) && key == K_TAB {
-                        focus = move_focus(state, focus, false);
-                        continue;
-                    }
-                    match handle_key(state, key, &l, focus) {
-                        KeyAction::Quit => return Ok(()),
-                        KeyAction::Apply => {
-                            run_apply(app, state, focus)?;
-                            focus = None;
-                        }
-                        KeyAction::Select => select_current(state),
-                        KeyAction::Discard => {
-                            state.pending = Pending::default();
-                            state.set_message("Discarded staged changes", false);
-                        }
-                        KeyAction::Activate(Hit::Apply) => {
-                            run_apply(app, state, focus)?;
-                            focus = None;
-                        }
-                        KeyAction::Activate(control) => activate(state, control),
-                        KeyAction::Focus(next) => focus = next,
-                        KeyAction::Help => {
-                            help = true;
-                            focus = None;
-                        }
-                        KeyAction::Redraw | KeyAction::None => {}
-                    }
-                }
-                Event::ButtonPress(e) => {
-                    let l = layout(app.w, app.h);
-                    let shift = e.state.contains(KeyButMask::SHIFT);
-                    let at = hit(app.w, app.h, e.event_x, e.event_y, state);
-                    let pressed = match pointer_action(e.detail, shift, at) {
-                        Pointer::Scroll(rows) => {
-                            scroll_by(state, &l, rows);
-                            None
-                        }
-                        Pointer::Page(pages) => {
-                            scroll_by(state, &l, pages * l.visible_rows.max(1) as i32);
-                            None
-                        }
-                        Pointer::Press(control) => Some(control),
-                        Pointer::Ignore => None,
-                    };
-                    match pressed {
-                        Some(Hit::Tile(i)) => {
-                            state.selected = i;
-                            select_current(state);
-                            focus = None;
-                        }
-                        Some(Hit::Apply) => {
-                            run_apply(app, state, None)?;
-                            focus = None;
-                        }
-                        Some(Hit::Cancel) => {
-                            activate(state, Hit::Cancel);
-                            focus = None;
-                        }
-                        Some(control) => {
-                            // A click on a setting changes it once, the same
-                            // as pressing Space on it.
-                            activate(state, control);
-                            focus = None;
-                        }
-                        None => {}
-                    }
-                }
-                Event::ClientMessage(e) => {
-                    if e.type_ == atom_id(&app.atoms, "WM_PROTOCOLS") {
-                        return Ok(());
-                    }
-                }
-                Event::RandrScreenChangeNotify(_) => {
-                    app.screens_dirty = true;
-                }
-                _ => dirty = false,
+        loop {
+            let event = match queued.take() {
+                Some(event) => event,
+                None => match app.c.poll_for_event().map_err(|e| e.to_string())? {
+                    Some(event) => event,
+                    None => break,
+                },
+            };
+            if handle_event(app, state, &mut ui, event)? == Flow::Quit {
+                return Ok(());
             }
         }
+        app.wake.drain();
         if app.collect_thumbs() {
-            dirty = true;
+            ui.dirty = true;
         }
-        if app.screens_dirty || app.reread_screens() {
+        if app.watcher.drain() {
+            app.debounce.note(Instant::now());
+        }
+        if app.screens_dirty {
+            // A monitor change is refreshed at once: the screen choice and
+            // the per-screen plan depend on it.
             app.screens_dirty = false;
-            app.last_activity = Instant::now();
-            if let Err(err) = refresh(state) {
-                state.set_message(err, true);
-            }
-            app.thumbs.forget_changed();
-            dirty = true;
-        } else if !handled && app.last_activity.elapsed() >= REFRESH {
-            app.last_activity = Instant::now();
-            if app.reread_screens() {
-                sync_screens(app, state);
-            }
-            if let Err(err) = refresh(state) {
-                state.set_message(err, true);
-            }
-            app.thumbs.forget_changed();
-            dirty = true;
+            app.reread_screens();
+            refresh_now(app, state);
+            ui.dirty = true;
+        } else if !state.busy && app.debounce.take(Instant::now()) {
+            refresh_now(app, state);
+            ui.dirty = true;
         }
-        if dirty {
+        if ui.dirty {
             app.palette = state.palette;
-            if help {
+            if ui.help {
                 paint_help(app)?;
             } else {
-                app.paint(state, focus)?;
+                app.paint(state, ui.focus)?;
             }
             app.flush()?;
-            dirty = false;
-        } else {
-            app.c.flush().map_err(|e| e.to_string())?;
+            ui.dirty = false;
         }
         request_visible_previews(app, state);
-        if !handled {
-            wait_for_input(app)?;
+        app.c.flush().map_err(|e| e.to_string())?;
+        // Painting waits for replies, which can queue events without the
+        // socket being readable; handle those before sleeping.
+        if let Some(event) = app.c.poll_for_event().map_err(|e| e.to_string())? {
+            queued = Some(event);
+            continue;
         }
+        let timeout = if state.busy {
+            None
+        } else {
+            app.debounce.timeout(Instant::now())
+        };
+        wait_for_input(app, timeout);
     }
+}
+
+/// Take a fresh report from the desktop now, and follow it everywhere the
+/// window keeps something derived from it.
+fn refresh_now(app: &mut App, state: &mut State) {
+    if let Err(err) = refresh(state) {
+        state.set_message(err, true);
+    }
+    sync_screens(app, state);
+    app.thumbs.forget_changed();
+    app.watch(state);
+}
+
+/// Handle one X event.
+fn handle_event(
+    app: &mut App,
+    state: &mut State,
+    ui: &mut Ui,
+    event: Event,
+) -> Result<Flow, String> {
+    match event {
+        Event::Expose(e) => {
+            if e.count == 0 {
+                ui.dirty = true;
+            }
+        }
+        Event::ConfigureNotify(e) => {
+            if e.width != app.w || e.height != app.h {
+                app.w = e.width.max(MIN_WIDTH);
+                app.h = e.height.max(MIN_HEIGHT);
+                app.resize_backing()?;
+                ui.dirty = true;
+            }
+        }
+        // Coming back to the window is when a change made elsewhere is
+        // most likely; grabs (a window manager shortcut) are not a return.
+        Event::FocusIn(e) => {
+            if e.mode == NotifyMode::NORMAL && e.detail != NotifyDetail::POINTER {
+                app.debounce.note(Instant::now());
+            }
+        }
+        Event::PropertyNotify(e) => {
+            if e.window == app.root && e.atom == atom_id(&app.atoms, WALLPAPER_STATE) {
+                // NIRUWM published what it rendered.
+                app.debounce.note(Instant::now());
+            }
+        }
+        Event::KeyPress(e) => {
+            ui.dirty = true;
+            let l = layout(app.w, app.h);
+            let key = app.keys.sym(e.detail);
+            // Ctrl+D discards; plain D moves focus back. Neither
+            // shadows the plain letters people already use here.
+            let ctrl = e.state.contains(KeyButMask::CONTROL);
+            if ctrl && key == K_D {
+                state.pending = Pending::default();
+                state.set_message("Discarded staged changes", false);
+                ui.focus = None;
+                ui.help = false;
+                return Ok(Flow::Continue);
+            }
+            if ui.help {
+                ui.help = false;
+                ui.focus = None;
+                return Ok(Flow::Continue);
+            }
+            if e.state.contains(KeyButMask::SHIFT) && key == K_TAB {
+                ui.focus = move_focus(state, ui.focus, false);
+                return Ok(Flow::Continue);
+            }
+            match handle_key(state, key, &l, ui.focus) {
+                KeyAction::Quit => return Ok(Flow::Quit),
+                KeyAction::Apply => {
+                    run_apply(app, state, ui.focus)?;
+                    ui.focus = None;
+                }
+                KeyAction::Select => select_current(state),
+                KeyAction::Discard => {
+                    state.pending = Pending::default();
+                    state.set_message("Discarded staged changes", false);
+                }
+                KeyAction::Activate(Hit::Apply) => {
+                    run_apply(app, state, ui.focus)?;
+                    ui.focus = None;
+                }
+                KeyAction::Activate(control) => activate(state, control),
+                KeyAction::Focus(next) => ui.focus = next,
+                KeyAction::Help => {
+                    ui.help = true;
+                    ui.focus = None;
+                }
+                KeyAction::Redraw | KeyAction::None => {}
+            }
+        }
+        Event::ButtonPress(e) => {
+            ui.dirty = true;
+            let l = layout(app.w, app.h);
+            let shift = e.state.contains(KeyButMask::SHIFT);
+            let at = hit(app.w, app.h, e.event_x, e.event_y, state);
+            let pressed = match pointer_action(e.detail, shift, at) {
+                Pointer::Scroll(rows) => {
+                    scroll_by(state, &l, rows);
+                    None
+                }
+                Pointer::Page(pages) => {
+                    scroll_by(state, &l, pages * l.visible_rows.max(1) as i32);
+                    None
+                }
+                Pointer::Press(control) => Some(control),
+                Pointer::Ignore => None,
+            };
+            match pressed {
+                Some(Hit::Tile(i)) => {
+                    state.selected = i;
+                    select_current(state);
+                    ui.focus = None;
+                }
+                Some(Hit::Apply) => {
+                    run_apply(app, state, None)?;
+                    ui.focus = None;
+                }
+                Some(Hit::Cancel) => {
+                    activate(state, Hit::Cancel);
+                    ui.focus = None;
+                }
+                Some(control) => {
+                    // A click on a setting changes it once, the same
+                    // as pressing Space on it.
+                    activate(state, control);
+                    ui.focus = None;
+                }
+                None => {}
+            }
+        }
+        Event::ClientMessage(e) => {
+            if e.type_ == atom_id(&app.atoms, "WM_PROTOCOLS") {
+                return Ok(Flow::Quit);
+            }
+        }
+        Event::RandrScreenChangeNotify(_) => {
+            app.screens_dirty = true;
+        }
+        _ => {}
+    }
+    Ok(Flow::Continue)
 }
 
 /// Add or remove the screens the window knows about in the desktop state.
@@ -2160,27 +2256,26 @@ pub fn sync_screen_names(names: impl IntoIterator<Item = String>, state: &mut St
     }
 }
 
-/// Block until the server has something to say or the refresh is due.
+/// Block until the X server, a watched file or a worker has something to
+/// say, or until `timeout` (a pending debounced refresh) runs out.
 ///
-/// The connection is owned by this thread, so the window waits on its socket
-/// rather than spinning: a keypress wakes it immediately, and a theme change
-/// made elsewhere is noticed on the next refresh.
-fn wait_for_input(app: &App) -> Result<(), String> {
+/// With nothing pending there is no timeout at all: an idle window sleeps
+/// until something happens.
+fn wait_for_input(app: &App, timeout: Option<Duration>) {
     use std::os::unix::io::AsRawFd;
-    let fd = app.c.stream().as_raw_fd();
-    let remaining = REFRESH
-        .checked_sub(app.last_activity.elapsed())
-        .unwrap_or(Duration::from_millis(20))
-        .max(Duration::from_millis(20));
-    let mut poll = libc::pollfd {
-        fd,
-        events: libc::POLLIN,
-        revents: 0,
+    let mut fds =
+        [app.c.stream().as_raw_fd(), app.watcher.fd(), app.wake.fd()].map(|fd| libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        });
+    let ms = match timeout {
+        // Round up, so the loop never wakes a millisecond early and spins.
+        Some(t) => t.as_micros().div_ceil(1000).min(i32::MAX as u128) as i32,
+        None => -1,
     };
-    let ms = remaining.as_millis().min(i32::MAX as u128) as i32;
-    // SAFETY: one pollfd describing the live X socket is passed.
-    let _ = unsafe { libc::poll(&mut poll, 1, ms) };
-    Ok(())
+    // SAFETY: a live array of pollfd structures and its length.
+    let _ = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, ms) };
 }
 
 /// Show "applying", run the transaction, and leave the result in the footer.

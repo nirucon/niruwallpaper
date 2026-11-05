@@ -5,10 +5,12 @@
 //! through `niructl`. It owns no settings and runs no wallpaper daemon.
 
 mod backend;
+mod import;
 mod screens;
 mod text;
 mod theme;
 mod thumbs;
+mod watch;
 mod window;
 
 use std::process::ExitCode;

@@ -164,10 +164,16 @@ impl Status {
 
 /// Find the control command the desktop already installed.
 ///
-/// The installed generation keeps it beside the session, and `~/.local/bin`
+/// `NIRUWALLPAPER_NIRUCTL` names one explicitly. Otherwise the installed
+/// generation keeps it beside the session, and `~/.local/bin`
 /// always carries a symlink; `PATH` is tried last so a hand-run build still
 /// works from a checkout.
 pub fn find_niructl() -> Option<PathBuf> {
+    // An explicit command wins, so a test (or a packager) can point the
+    // window at another niructl without changing HOME or PATH.
+    if let Some(path) = std::env::var_os("NIRUWALLPAPER_NIRUCTL").filter(|p| !p.is_empty()) {
+        return Some(PathBuf::from(path));
+    }
     let mut candidates = Vec::new();
     if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
         candidates.push(home.join(".local/share/nirux/current/bin/niructl"));
