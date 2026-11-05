@@ -463,7 +463,10 @@ impl App {
                     EventMask::EXPOSURE
                         | EventMask::KEY_PRESS
                         | EventMask::BUTTON_PRESS
-                        | EventMask::POINTER_MOTION
+                        | EventMask::BUTTON_RELEASE
+                        // Motion only while a button is held, for dragging
+                        // the scrollbar; hovering wakes nothing.
+                        | EventMask::BUTTON1_MOTION
                         | EventMask::STRUCTURE_NOTIFY
                         | EventMask::FOCUS_CHANGE,
                 ),
@@ -848,7 +851,7 @@ impl App {
 
     /// Draw the whole window. One function so a click and a repaint can never
     /// disagree about where a control is.
-    pub fn paint(&self, state: &State, focus: Option<Hit>) -> Result<(), String> {
+    pub fn paint(&self, state: &State, focus: Option<Hit>, dragging: bool) -> Result<(), String> {
         let l = layout(self.w, self.h);
         self.fill(
             self.palette.background,
@@ -969,6 +972,25 @@ impl App {
                     self.palette.foreground
                 },
                 11.0,
+            )?;
+        }
+        self.clip(None)?;
+        self.label(
+            l.left.x + 8,
+            l.left.y - 24,
+            &position_label(&l, state),
+            self.palette.muted,
+            12.0,
+        )?;
+        if let Some((track, thumb)) = scrollbar(&l, state) {
+            self.fill(self.palette.surface, track)?;
+            self.fill(
+                if dragging {
+                    self.palette.foreground
+                } else {
+                    self.palette.border
+                },
+                thumb,
             )?;
         }
 
@@ -1392,6 +1414,8 @@ pub enum Hit {
     ScreenFollow,
     Apply,
     Cancel,
+    /// The grid's scrollbar track.
+    Scrollbar,
 }
 
 /// The layout for one window size.
@@ -1497,6 +1521,7 @@ pub fn hit_rect(l: &Layout, hit: Hit, state: &State) -> Option<Rectangle> {
         Hit::ScreenFollow => settings_rect(l),
         Hit::Apply => apply_rect(l),
         Hit::Cancel => cancel_rect(l),
+        Hit::Scrollbar => scrollbar(l, state)?.0,
     })
 }
 
@@ -1520,6 +1545,17 @@ pub fn hit(w: u16, h: u16, x: i16, y: i16, state: &State) -> Option<Hit> {
         }
     }
     // Tiles, in the order they are painted.
+    if let Some((track, _)) = scrollbar(&l, state) {
+        // A little wider than it is drawn, so it is easy to take.
+        let grab = Rectangle {
+            x: track.x - 4,
+            width: track.width + 8,
+            ..track
+        };
+        if inside(grab, x, y) {
+            return Some(Hit::Scrollbar);
+        }
+    }
     // A tile is only clickable where it is drawn: inside the grid.
     if inside(l.left, x, y) {
         let count = state.visible().len();
@@ -1863,6 +1899,10 @@ const K_L: u32 = b'l' as u32;
 const K_A: u32 = b'a' as u32;
 const K_D: u32 = b'd' as u32;
 const K_F1: u32 = 0xffbe;
+const K_HOME: u32 = 0xff50;
+const K_PAGE_UP: u32 = 0xff55;
+const K_PAGE_DOWN: u32 = 0xff56;
+const K_END: u32 = 0xff57;
 
 /// Keycode-to-keysym table for the connected keyboard.
 ///
@@ -2003,8 +2043,88 @@ pub fn handle_key(state: &mut State, key: u32, _l: &Layout, focus: Option<Hit>) 
             ensure_visible(state, _l);
             KeyAction::Redraw
         }
+        K_PAGE_DOWN | K_PAGE_UP | K_HOME | K_END => {
+            let count = state.visible().len();
+            let page = _l.tiles_per_row * _l.visible_rows.max(1);
+            state.selected = match key {
+                K_PAGE_DOWN => state.selected + page,
+                K_PAGE_UP => state.selected.saturating_sub(page),
+                K_HOME => 0,
+                _ => count,
+            }
+            .min(count.saturating_sub(1));
+            ensure_visible(state, _l);
+            KeyAction::Redraw
+        }
         _ => KeyAction::None,
     }
+}
+
+/// The tiles shown now, counting a partly visible row, as "Wallpapers 1–16
+/// of 24".
+pub fn position_label(l: &Layout, state: &State) -> String {
+    let count = state.visible().len();
+    if count == 0 {
+        return "No wallpapers".into();
+    }
+    let range = preview_range(l, state.scroll, count);
+    // `preview_range` adds a row of look-ahead; the label shows what is in
+    // view.
+    let in_view = range.start
+        ..range
+            .end
+            .min(range.start + l.tiles_per_row * rows_in_view(l, state.scroll));
+    format!(
+        "Wallpapers {}\u{2013}{} of {count}",
+        in_view.start + 1,
+        in_view.end.min(count)
+    )
+}
+
+/// Rows that intersect the grid, a partly visible one included.
+fn rows_in_view(l: &Layout, scroll: usize) -> usize {
+    let per_row = l.tiles_per_row.max(1);
+    let first = scroll * per_row;
+    let mut rows = 0;
+    while intersects(tile_rect(l, first + rows * per_row, scroll), l.left) {
+        rows += 1;
+    }
+    rows
+}
+
+/// The scrollbar's track and thumb, when the list does not fit.
+pub fn scrollbar(l: &Layout, state: &State) -> Option<(Rectangle, Rectangle)> {
+    let max = max_scroll(state, l);
+    if max == 0 {
+        return None;
+    }
+    let track = Rectangle {
+        x: l.left.x + l.left.width as i16 - 12,
+        y: l.left.y + 8,
+        width: 6,
+        height: l.left.height.saturating_sub(16).max(24),
+    };
+    let total = total_rows(state, l).max(1);
+    let thumb_h = (u32::from(track.height) * l.visible_rows as u32 / total as u32)
+        .clamp(20, u32::from(track.height)) as u16;
+    let travel = i32::from(track.height - thumb_h);
+    let offset = travel * state.scroll.min(max) as i32 / max as i32;
+    Some((
+        track,
+        Rectangle {
+            y: track.y + offset as i16,
+            height: thumb_h,
+            ..track
+        },
+    ))
+}
+
+/// The scroll position for a thumb dragged so its top is at `thumb_top`.
+pub fn scroll_for_thumb(track: Rectangle, thumb: Rectangle, max: usize, thumb_top: i16) -> usize {
+    let travel = i32::from(track.height.saturating_sub(thumb.height)).max(1);
+    let offset = i32::from(thumb_top - track.y).clamp(0, travel);
+    // Round to the nearest row, so the thumb follows the pointer evenly.
+    ((offset * max as i32 * 2 + travel) / (travel * 2)) as usize
 }
 
 /// What one pointer button does.
@@ -2083,6 +2203,8 @@ pub fn help_lines() -> Vec<&'static str> {
 struct Ui {
     focus: Option<Hit>,
     help: bool,
+    /// While the scrollbar is dragged: where in the thumb it was taken.
+    drag: Option<i16>,
     dirty: bool,
 }
 
@@ -2152,7 +2274,7 @@ pub fn run(app: &mut App, state: &mut State, _palette: Palette) -> Result<(), St
             if ui.help {
                 paint_help(app)?;
             } else {
-                app.paint(state, ui.focus)?;
+                app.paint(state, ui.focus, ui.drag.is_some())?;
             }
             app.flush()?;
             ui.dirty = false;
@@ -2282,6 +2404,17 @@ fn handle_event(
                 Pointer::Ignore => None,
             };
             match pressed {
+                Some(Hit::Scrollbar) => {
+                    if let Some((_, thumb)) = scrollbar(&l, state) {
+                        if e.event_y >= thumb.y && e.event_y < thumb.y + thumb.height as i16 {
+                            ui.drag = Some(e.event_y - thumb.y);
+                        } else {
+                            // A click on the track pages towards it.
+                            let pages = if e.event_y < thumb.y { -1 } else { 1 };
+                            scroll_by(state, &l, pages * l.visible_rows.max(1) as i32);
+                        }
+                    }
+                }
                 Some(Hit::Tile(i)) => {
                     state.selected = i;
                     select_current(state);
@@ -2303,6 +2436,23 @@ fn handle_event(
                 }
                 None => {}
             }
+        }
+        Event::MotionNotify(e) => {
+            if let Some(grab) = ui.drag {
+                let l = layout(app.w, app.h);
+                if let Some((track, thumb)) = scrollbar(&l, state) {
+                    let max = max_scroll(state, &l);
+                    let scroll = scroll_for_thumb(track, thumb, max, e.event_y - grab);
+                    if scroll != state.scroll {
+                        state.scroll = scroll;
+                        ui.dirty = true;
+                    }
+                }
+            }
+        }
+        Event::ButtonRelease(e) if e.detail == 1 && ui.drag.is_some() => {
+            ui.drag = None;
+            ui.dirty = true;
         }
         Event::ClientMessage(e) => {
             if e.type_ == atom_id(&app.atoms, "WM_PROTOCOLS") {
@@ -2515,7 +2665,8 @@ fn activate(state: &mut State, control: Hit) {
             state.pending.scale = None;
             state.set_message("Stage: follow the shared settings", false);
         }
-        Hit::Apply => {}
+        // Apply is run by the caller; the scrollbar is dragged, not pressed.
+        Hit::Apply | Hit::Scrollbar => {}
         Hit::Cancel => {
             state.pending = Pending::default();
             state.set_message("Discarded staged changes", false);
@@ -2808,6 +2959,54 @@ mod tests {
         finish_apply(&mut state, Ok((status, list)));
         assert!(state.pending.is_empty());
         assert!(!state.busy);
+    }
+
+    #[test]
+    fn the_position_and_the_scrollbar_follow_the_scroll() {
+        let mut state = fixture(24);
+        let l = layout(WIDTH, HEIGHT);
+        // Three full rows and a partly visible fourth: tiles 1-16.
+        assert_eq!(position_label(&l, &state), "Wallpapers 1\u{2013}16 of 24");
+        let (track, top) = scrollbar(&l, &state).expect("24 tiles need a scrollbar");
+        assert_eq!(top.y, track.y);
+        scroll_by(&mut state, &l, 100);
+        assert_eq!(position_label(&l, &state), "Wallpapers 13\u{2013}24 of 24");
+        let (track, bottom) = scrollbar(&l, &state).unwrap();
+        assert_eq!(
+            bottom.y + bottom.height as i16,
+            track.y + track.height as i16
+        );
+        // Dragging the thumb to either end and back maps to the scroll.
+        let max = max_scroll(&state, &l);
+        assert_eq!(scroll_for_thumb(track, bottom, max, track.y - 50), 0);
+        assert_eq!(scroll_for_thumb(track, bottom, max, track.y + 2000), max);
+        assert_eq!(scroll_for_thumb(track, bottom, max, bottom.y), max);
+        // The scrollbar is a control of its own, never a tile.
+        assert_eq!(
+            hit(WIDTH, HEIGHT, track.x + 2, track.y + 4, &state),
+            Some(Hit::Scrollbar)
+        );
+        // A list that fits has none.
+        assert!(scrollbar(&l, &fixture(4)).is_none());
+        assert_eq!(position_label(&l, &fixture(0)), "No wallpapers");
+    }
+
+    #[test]
+    fn page_keys_home_and_end_move_by_pages() {
+        let mut state = fixture(40);
+        let l = layout(WIDTH, HEIGHT);
+        let page = l.tiles_per_row * l.visible_rows;
+        handle_key(&mut state, K_PAGE_DOWN, &l, None);
+        assert_eq!(state.selected, page);
+        assert!(state.scroll > 0, "the new selection is scrolled into view");
+        handle_key(&mut state, K_END, &l, None);
+        assert_eq!(state.selected, 39);
+        assert_eq!(state.scroll, max_scroll(&state, &l));
+        handle_key(&mut state, K_PAGE_UP, &l, None);
+        assert_eq!(state.selected, 39 - page);
+        handle_key(&mut state, K_HOME, &l, None);
+        assert_eq!((state.selected, state.scroll), (0, 0));
+        assert!(state.pending.is_empty(), "paging never stages");
     }
 
     #[test]
