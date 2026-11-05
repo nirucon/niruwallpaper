@@ -1823,6 +1823,51 @@ pub fn handle_key(state: &mut State, key: u32, _l: &Layout, focus: Option<Hit>) 
     }
 }
 
+/// What one pointer button does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Pointer {
+    /// The primary button pressed a control.
+    Press(Hit),
+    /// The wheel scrolls the grid by this many rows.
+    Scroll(i32),
+    /// Shift and the wheel scroll by this many pages.
+    Page(i32),
+    /// Every other button, and a press outside any control.
+    Ignore,
+}
+
+/// Map a button press to an action. Only button 1 selects or presses
+/// anything; buttons 4 and 5 are the wheel and scroll the grid (with Shift,
+/// one page); the horizontal wheel (6 and 7) and the other buttons are
+/// ignored, so turning the wheel can never stage a wallpaper.
+pub fn pointer_action(button: u8, shift: bool, at: Option<Hit>) -> Pointer {
+    match button {
+        1 => at.map_or(Pointer::Ignore, Pointer::Press),
+        4 if shift => Pointer::Page(-1),
+        5 if shift => Pointer::Page(1),
+        4 => Pointer::Scroll(-1),
+        5 => Pointer::Scroll(1),
+        _ => Pointer::Ignore,
+    }
+}
+
+/// The number of tile rows the current list needs.
+pub fn total_rows(state: &State, l: &Layout) -> usize {
+    state.visible().len().div_ceil(l.tiles_per_row.max(1))
+}
+
+/// The largest scroll position that still fills the grid.
+pub fn max_scroll(state: &State, l: &Layout) -> usize {
+    total_rows(state, l).saturating_sub(l.visible_rows.max(1))
+}
+
+/// Scroll the grid by whole rows without touching the selection or the
+/// staged changes.
+pub fn scroll_by(state: &mut State, l: &Layout, rows: i32) {
+    let target = state.scroll as i64 + i64::from(rows);
+    state.scroll = target.clamp(0, max_scroll(state, l) as i64) as usize;
+}
+
 /// Scroll so the selected tile is on screen.
 fn ensure_visible(state: &mut State, l: &Layout) {
     let row = state.selected / l.tiles_per_row;
@@ -1926,7 +1971,22 @@ pub fn run(app: &mut App, state: &mut State, _palette: Palette) -> Result<(), St
                     }
                 }
                 Event::ButtonPress(e) => {
-                    match hit(app.w, app.h, e.event_x, e.event_y, state) {
+                    let l = layout(app.w, app.h);
+                    let shift = e.state.contains(KeyButMask::SHIFT);
+                    let at = hit(app.w, app.h, e.event_x, e.event_y, state);
+                    let pressed = match pointer_action(e.detail, shift, at) {
+                        Pointer::Scroll(rows) => {
+                            scroll_by(state, &l, rows);
+                            None
+                        }
+                        Pointer::Page(pages) => {
+                            scroll_by(state, &l, pages * l.visible_rows.max(1) as i32);
+                            None
+                        }
+                        Pointer::Press(control) => Some(control),
+                        Pointer::Ignore => None,
+                    };
+                    match pressed {
                         Some(Hit::Tile(i)) => {
                             state.selected = i;
                             select_current(state);
@@ -2213,4 +2273,89 @@ fn paint_help(app: &App) -> Result<(), String> {
         12.0,
     )?;
     app.flush()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A window state with `count` official pictures and no desktop behind it.
+    fn fixture(count: usize) -> State {
+        let list = (0..count)
+            .map(|i| Wallpaper {
+                name: format!("Picture {i}"),
+                path: PathBuf::from(format!("/fixture/w{i:02}.png")),
+                official: true,
+            })
+            .collect();
+        State {
+            status: Status {
+                enabled: true,
+                follow_theme: true,
+                mode: "random".into(),
+                scale: "fill".into(),
+                ..Status::default()
+            },
+            list,
+            tab: Tab::Official,
+            target: Target::All,
+            selected: 0,
+            scroll: 0,
+            pending: Pending::default(),
+            message: String::new(),
+            message_is_error: false,
+            seen: String::new(),
+            busy: false,
+            palette: Palette::fallback(),
+        }
+    }
+
+    #[test]
+    fn the_wheel_scrolls_and_never_stages() {
+        let mut state = fixture(30);
+        let l = layout(WIDTH, HEIGHT);
+        let over_tile = Some(Hit::Tile(5));
+        // Fifteen notches over a tile: only scrolling, never a selection.
+        for _ in 0..15 {
+            match pointer_action(5, false, over_tile) {
+                Pointer::Scroll(rows) => scroll_by(&mut state, &l, rows),
+                other => panic!("the wheel became {other:?}"),
+            }
+        }
+        assert!(
+            state.pending.is_empty(),
+            "the wheel staged {:?}",
+            state.pending
+        );
+        assert_eq!(state.selected, 0);
+        assert_eq!(state.scroll, max_scroll(&state, &l));
+        assert!(state.scroll > 0);
+        assert_eq!(pointer_action(4, false, over_tile), Pointer::Scroll(-1));
+        assert_eq!(pointer_action(4, true, over_tile), Pointer::Page(-1));
+        assert_eq!(pointer_action(5, true, over_tile), Pointer::Page(1));
+        // The horizontal wheel and the other buttons do nothing.
+        for button in [2, 3, 6, 7, 8, 9] {
+            assert_eq!(pointer_action(button, false, over_tile), Pointer::Ignore);
+        }
+        // Only the primary button presses a control.
+        assert_eq!(
+            pointer_action(1, false, over_tile),
+            Pointer::Press(Hit::Tile(5))
+        );
+        assert_eq!(pointer_action(1, false, None), Pointer::Ignore);
+    }
+
+    #[test]
+    fn scrolling_stops_at_both_ends() {
+        let mut state = fixture(30);
+        let l = layout(WIDTH, HEIGHT);
+        scroll_by(&mut state, &l, -3);
+        assert_eq!(state.scroll, 0);
+        scroll_by(&mut state, &l, 1000);
+        assert_eq!(state.scroll, max_scroll(&state, &l));
+        // A list that fits never scrolls.
+        let mut small = fixture(2);
+        scroll_by(&mut small, &l, 5);
+        assert_eq!(small.scroll, 0);
+    }
 }
