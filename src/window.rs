@@ -42,6 +42,8 @@ const TILE_W: i16 = 148;
 const TILE_H: i16 = 132;
 const PANEL_W: i16 = 300;
 const FOOTER: i16 = 86;
+/// Space between the bottom of the grid and the status line.
+const GRID_GAP: i16 = 4;
 
 /// How often the window asks the desktop whether anything changed.
 ///
@@ -624,6 +626,22 @@ impl App {
         Ok(())
     }
 
+    /// Limit drawing to one rectangle, or lift the limit.
+    fn clip(&self, rect: Option<Rectangle>) -> Result<(), String> {
+        match rect {
+            Some(r) => self
+                .c
+                .set_clip_rectangles(ClipOrdering::UNSORTED, self.gc, 0, 0, &[r])
+                .map_err(|e| e.to_string())
+                .map(drop),
+            None => self
+                .c
+                .change_gc(self.gc, &ChangeGCAux::new().clip_mask(x11rb::NONE))
+                .map_err(|e| e.to_string())
+                .map(drop),
+        }
+    }
+
     fn fill(&self, colour: u32, rect: Rectangle) -> Result<(), String> {
         if rect.width == 0 || rect.height == 0 {
             return Ok(());
@@ -848,9 +866,12 @@ impl App {
                 )?;
             }
         }
+        // Tiles are clipped to the grid, so a partly visible row can never
+        // be drawn over the status line, the key hints or the header.
+        self.clip(Some(l.left))?;
         for (i, entry) in visible.iter().enumerate() {
             let rect = tile_rect(&l, i, state.scroll);
-            if (rect.y + rect.height as i16) < (l.left.y + 4) || rect.y > self.h as i16 {
+            if !intersects(rect, l.left) {
                 continue;
             }
             let active = state
@@ -906,6 +927,8 @@ impl App {
                 11.0,
             )?;
         }
+
+        self.clip(None)?;
 
         self.paint_panel(state, &l, focus)?;
 
@@ -1327,13 +1350,16 @@ pub fn layout(w: u16, h: u16) -> Layout {
     let top = HEADER + ROW;
     let footer = h - FOOTER;
     let tiles_per_row = ((list_w / TILE_W).max(1)) as usize;
-    let visible_rows = ((footer - top) / TILE_H).max(1) as usize;
+    // The grid ends a little above the status line, and only rows that fit
+    // completely count as visible; a partly visible row is clipped.
+    let grid_h = (footer - top - GRID_GAP).max(1);
+    let visible_rows = ((grid_h - 8) / TILE_H).max(1) as usize;
     Layout {
         left: Rectangle {
             x: PAD,
             y: top,
             width: (list_w + PAD).max(1) as u16,
-            height: (footer - top).max(1) as u16,
+            height: grid_h as u16,
         },
         panel: Rectangle {
             x: w - PAD - PANEL_W,
@@ -1398,11 +1424,14 @@ pub fn hit(w: u16, h: u16, x: i16, y: i16, state: &State) -> Option<Hit> {
         }
     }
     // Tiles, in the order they are painted.
-    let count = state.visible().len();
-    for i in 0..count {
-        let rect = tile_rect(&l, i, state.scroll);
-        if inside(rect, x, y) {
-            return Some(Hit::Tile(i));
+    // A tile is only clickable where it is drawn: inside the grid.
+    if inside(l.left, x, y) {
+        let count = state.visible().len();
+        for i in 0..count {
+            let rect = tile_rect(&l, i, state.scroll);
+            if inside(rect, x, y) {
+                return Some(Hit::Tile(i));
+            }
         }
     }
     let scale = scale_rects(&l);
@@ -1446,6 +1475,14 @@ fn screen_rects(l: &Layout, count: usize) -> Vec<Rectangle> {
         x += width as i16 + 6;
     }
     out
+}
+
+/// True when two rectangles overlap by at least one pixel.
+fn intersects(a: Rectangle, b: Rectangle) -> bool {
+    a.x < b.x + b.width as i16
+        && b.x < a.x + a.width as i16
+        && a.y < b.y + b.height as i16
+        && b.y < a.y + a.height as i16
 }
 
 fn inside(r: Rectangle, x: i16, y: i16) -> bool {
@@ -1813,10 +1850,12 @@ pub fn handle_key(state: &mut State, key: u32, _l: &Layout, focus: Option<Hit>) 
             let count = state.visible().len();
             let l = _l;
             state.selected = (state.selected + l.tiles_per_row).min(count.saturating_sub(1));
+            ensure_visible(state, l);
             KeyAction::Redraw
         }
         K_UP | K_K => {
             state.selected = state.selected.saturating_sub(_l.tiles_per_row);
+            ensure_visible(state, _l);
             KeyAction::Redraw
         }
         _ => KeyAction::None,
@@ -2343,6 +2382,53 @@ mod tests {
             Pointer::Press(Hit::Tile(5))
         );
         assert_eq!(pointer_action(1, false, None), Pointer::Ignore);
+    }
+
+    #[test]
+    fn the_grid_is_clipped_above_the_status_line() {
+        let state = fixture(30);
+        for (w, h) in [(MIN_WIDTH, MIN_HEIGHT), (WIDTH, HEIGHT), (1600, 1200)] {
+            let l = layout(w, h);
+            let grid_bottom = l.left.y + l.left.height as i16;
+            assert!(
+                grid_bottom <= l.footer,
+                "{w}x{h}: the grid reaches into the status line"
+            );
+            // Every row counted as visible fits completely in the grid.
+            let last_full = tile_rect(&l, l.visible_rows * l.tiles_per_row - 1, 0);
+            assert!(
+                last_full.y + last_full.height as i16 <= grid_bottom,
+                "{w}x{h}: visible row {} does not fit",
+                l.visible_rows
+            );
+            // The next row is at most partly visible, and is clipped.
+            let next = tile_rect(&l, l.visible_rows * l.tiles_per_row, 0);
+            assert!(next.y + next.height as i16 > grid_bottom);
+            // Nothing in the status line or hint line is a tile.
+            for y in [l.footer + 6, l.footer + 30, h as i16 - 2] {
+                assert!(
+                    !matches!(hit(w, h, l.left.x + 20, y, &state), Some(Hit::Tile(_))),
+                    "{w}x{h}: a click at y={y} on the status line hit a tile"
+                );
+            }
+        }
+        // The default size shows three full rows, as the window always did.
+        assert_eq!(layout(WIDTH, HEIGHT).visible_rows, 3);
+    }
+
+    #[test]
+    fn arrows_scroll_the_selection_into_view() {
+        let mut state = fixture(30);
+        let l = layout(WIDTH, HEIGHT);
+        for _ in 0..5 {
+            handle_key(&mut state, K_DOWN, &l, None);
+        }
+        let row = state.selected / l.tiles_per_row;
+        assert!(row >= state.scroll && row < state.scroll + l.visible_rows);
+        for _ in 0..5 {
+            handle_key(&mut state, K_UP, &l, None);
+        }
+        assert_eq!(state.scroll, 0);
     }
 
     #[test]
