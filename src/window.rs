@@ -528,16 +528,10 @@ impl App {
             format!("{APP_ID}\0{APP_ID}\0").as_bytes(),
         )
         .map_err(|e| e.to_string())?;
-        // A resizable window within the sizes the layout supports, so it stays
-        // usable on a small screen and gains room on a wide one.
-        let mut hints = vec![0u32; 18];
-        hints[0] = 1 << 4 | 1 << 5 | 1 << 10 | 1 << 11; // min, max, base
-        hints[5] = u32::from(MIN_WIDTH);
-        hints[6] = u32::from(MIN_HEIGHT);
-        hints[7] = 1;
-        hints[8] = 1;
-        hints[9] = PAD as u32;
-        hints[10] = PAD as u32;
+        // A resizable window with a preferred size and the smallest size the
+        // layout supports, so it stays usable on a small screen and gains room
+        // on a wide one.
+        let hints = normal_hints();
         c.change_property32(
             PropMode::REPLACE,
             win,
@@ -4026,5 +4020,35 @@ mod tests {
         let mut small = fixture(2);
         scroll_by(&mut small, &l, 5);
         assert_eq!(small.scroll, 0);
+    }
+}
+
+/// WM_NORMAL_HINTS (ICCCM 4.1.2.3): the preferred size (PSize) and the
+/// smallest size the layout supports (PMinSize). No maximum: a window manager
+/// clamps to it, and a bogus one shrank 0.2.0 to a 1x1 stub.
+fn normal_hints() -> [u32; 18] {
+    const P_SIZE: u32 = 1 << 3;
+    const P_MIN_SIZE: u32 = 1 << 4;
+    let mut hints = [0u32; 18];
+    hints[0] = P_SIZE | P_MIN_SIZE;
+    hints[3] = u32::from(WIDTH);
+    hints[4] = u32::from(HEIGHT);
+    hints[5] = u32::from(MIN_WIDTH);
+    hints[6] = u32::from(MIN_HEIGHT);
+    hints
+}
+
+#[cfg(test)]
+mod hint_tests {
+    use super::*;
+
+    #[test]
+    fn normal_hints_have_no_maximum() {
+        let h = normal_hints();
+        assert_eq!(h[0] & (1 << 5), 0, "PMaxSize must not be set");
+        assert_eq!(h[0], 1 << 3 | 1 << 4);
+        assert_eq!((h[3], h[4]), (1000, 690));
+        assert_eq!((h[5], h[6]), (660, 500));
+        assert!(h[7..].iter().all(|v| *v == 0));
     }
 }
