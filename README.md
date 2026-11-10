@@ -90,8 +90,8 @@ niruwallpaper --help
 | `Esc` or `q` | Close |
 
 The mouse wheel scrolls the grid by a row (with `Shift`, by a page); it never
-chooses a picture. Only the left button presses controls. "Wallpapers 1–16 of
-24" above the grid says where you are, and the thin scrollbar can be dragged or
+chooses a picture. Only the left button presses controls. The range and total
+above the grid (wallpapers 1 to 16 of 24, for example) say where you are, and the thin scrollbar can be dragged or
 clicked. The status line names the picture each connected screen shows, and
 says when no running window manager confirmed the result.
 
