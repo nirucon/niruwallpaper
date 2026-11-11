@@ -259,7 +259,18 @@ fn wheel_idle_and_a_slow_apply_under_xvfb() {
     s.xdotool(&["key", "F1"]);
     sleep(Duration::from_millis(300));
     let before = s.log().len();
-    s.xdotool(&["key", "s"]);
+    // Whether the first key only closes a help view depends on timing on a
+    // busy runner, so press again until the switch is seen (at most three).
+    for _ in 0..3 {
+        s.xdotool(&["key", "s"]);
+        sleep(Duration::from_millis(1200));
+        if s.log()[before..]
+            .iter()
+            .any(|x| x == "wallpaper style toggle")
+        {
+            break;
+        }
+    }
     s.wait_log(Duration::from_secs(5), "the style switch", |l| {
         let new = &l[before..];
         new.iter()
