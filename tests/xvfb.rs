@@ -3,7 +3,8 @@
 //! Ignored by default because it needs `Xvfb`, `xdotool` and `xwd`; CI runs
 //! it with `cargo test --locked -- --ignored`. The fixture serves 30
 //! wallpapers, records every argument vector it is started with, and can be
-//! told to take 5 seconds for an Apply.
+//! told to take 5 seconds for an Apply. Its `wallpaper style` can act as a
+//! niructl from before that command.
 
 use std::{
     fs,
@@ -26,6 +27,9 @@ case "$1 $2" in
 "wallpaper status-json")
   img="$theme_dir/nirux-wallpaper-w01.png"
   printf '{"theme":"niru-noir","enabled":true,"mode":"random","rotation_minutes":10,"scale":"fill","follow_theme":true,"file":"","dir":"%s","theme_dir":"%s","theme_image":"%s","outputs":[],"planned":[{"output":"screen","source":"inherit","mode":"theme","scale":"fill","image":"%s"}],"rendered":null}\n' "$dir" "$theme_dir" "$img" "$img" ;;
+"wallpaper style")
+  if [ -f "$FX/old" ]; then echo "usage: niructl wallpaper list|status" >&2; exit 2; fi
+  printf 'theme_style=signature\n' ;;
 "wallpaper apply")
   if [ -f "$FX/slow" ]; then sleep "$(cat "$FX/slow")"; fi
   printf 'done\n' >> "$FX/argv.log"
@@ -249,5 +253,31 @@ fn wheel_idle_and_a_slow_apply_under_xvfb() {
     s.wait_log(Duration::from_secs(1), "the refresh after a change", |l| {
         l[before..].iter().any(|x| x == "wallpaper status-json")
     });
+
+    // S switches the theme picture through niructl, then reads the desktop.
+    // The help view is still open; a key closes it first.
+    s.xdotool(&["key", "F1"]);
+    sleep(Duration::from_millis(300));
+    let before = s.log().len();
+    s.xdotool(&["key", "s"]);
+    s.wait_log(Duration::from_secs(5), "the style switch", |l| {
+        let new = &l[before..];
+        new.iter()
+            .position(|x| x == "wallpaper style toggle")
+            .is_some_and(|i| new[i..].iter().any(|x| x == "wallpaper status-json"))
+    });
+    // An older niructl refuses the command: the window says so and stays.
+    fs::write(s.root.join("old"), "").unwrap();
+    sleep(Duration::from_millis(500));
+    let before = s.log().len();
+    s.xdotool(&["key", "s"]);
+    s.wait_log(Duration::from_secs(5), "the refused style switch", |l| {
+        l[before..].iter().any(|x| x == "wallpaper style toggle")
+    });
+    sleep(Duration::from_millis(800));
+    assert!(
+        s.app.as_mut().unwrap().try_wait().unwrap().is_none(),
+        "the window closed after a refused style switch"
+    );
     assert!(Path::new(&s.root).exists());
 }

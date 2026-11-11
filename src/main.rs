@@ -82,6 +82,7 @@ fn print_status() -> ExitCode {
             println!("theme={}", status.theme);
             println!("enabled={}", status.enabled);
             println!("follow_theme={}", status.follow_theme);
+            println!("theme_style={}", status.theme_style);
             println!("mode={}", status.mode);
             println!("scale={}", status.scale);
             println!("rotation_minutes={}", status.rotation_minutes);

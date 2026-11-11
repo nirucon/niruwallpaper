@@ -35,9 +35,10 @@ pub const APP_ID: &str = "niruwallpaper";
 pub const APP_NAME: &str = "NIRU Wallpaper";
 
 const WIDTH: u16 = 1000;
-const HEIGHT: u16 = 690;
+const HEIGHT: u16 = 720;
 const MIN_WIDTH: u16 = 660;
-const MIN_HEIGHT: u16 = 500;
+/// Tall enough for the panel's three description lines above Apply.
+const MIN_HEIGHT: u16 = 540;
 
 const PAD: i16 = 20;
 const ROW: i16 = 26;
@@ -191,7 +192,7 @@ impl State {
 /// A snapshot of everything the window shows.
 fn snapshot(status: &Status, list: &[Wallpaper]) -> String {
     let mut out = format!(
-        "{:?}|{:?}|{:?}|{}|{}|{}|{}|{:?}|",
+        "{:?}|{:?}|{:?}|{}|{}|{}|{}|{:?}|{}|",
         status.enabled,
         status.mode,
         status.rotation_minutes,
@@ -199,7 +200,8 @@ fn snapshot(status: &Status, list: &[Wallpaper]) -> String {
         status.follow_theme,
         status.file,
         status.theme,
-        status.theme_image
+        status.theme_image,
+        status.theme_style
     );
     for screen in &status.screens {
         out.push_str(&format!(
@@ -815,6 +817,18 @@ impl App {
         self.label_on(r.x + 8, y, text, fg, bg, 13.0)
     }
 
+    /// The first of `labels` that fits a button `width` pixels wide, else
+    /// the last (shortest) one.
+    fn fit<'a>(&self, labels: &[&'a str], width: u16) -> &'a str {
+        let font = self.font.size(13.0);
+        labels
+            .iter()
+            .copied()
+            .find(|t| font.width(t) + 16.0 <= f32::from(width))
+            .or_else(|| labels.last().copied())
+            .unwrap_or("")
+    }
+
     fn selected(&self, hit: Option<Hit>, want: Hit, focus: Option<Hit>) -> bool {
         hit == Some(want) || focus == Some(want)
     }
@@ -871,21 +885,11 @@ impl App {
             },
         )?;
         self.label(PAD, PAD - 8, APP_NAME, self.palette.foreground, 20.0)?;
+        let theme = format!("Theme: {}", theme_label(&state.status.theme));
         let theme_line = match state.screens().as_slice() {
-            [] => format!(
-                "Theme: {}   No screens reported",
-                theme_label(&state.status.theme)
-            ),
-            [one] => format!(
-                "Theme: {}   Screen: {}",
-                theme_label(&state.status.theme),
-                one
-            ),
-            many => format!(
-                "Theme: {}   {} screens",
-                theme_label(&state.status.theme),
-                many.len()
-            ),
+            [] => format!("{theme}   No screens reported"),
+            [one] => format!("{theme}   Screen: {one}"),
+            many => format!("{theme}   {} screens", many.len()),
         };
         self.label(PAD, PAD + 22, &theme_line, self.palette.muted, 12.0)?;
         // Tabs.
@@ -1171,13 +1175,31 @@ impl App {
             follow,
             !state.busy,
         )?;
+        // Which picture a theme shows. It takes effect at once through
+        // niructl, like the window manager's own setting, and is not staged.
+        let style_r = style_rect(l);
+        let style_text = if state.status.signature_style() {
+            [
+                "Theme picture: Signature",
+                "Picture: Signature",
+                "Signature",
+            ]
+        } else {
+            ["Theme picture: Art", "Picture: Art", "Art"]
+        };
+        self.button(
+            style_r,
+            self.fit(&style_text, style_r.width),
+            false,
+            !state.busy,
+        )?;
 
         // What this target shows, and why.
         let lines = describe_target(state, &state.target);
         for (i, line) in lines.iter().enumerate() {
             self.label(
                 x,
-                l.panel.y + 230 + i as i16 * 18,
+                l.panel.y + 262 + i as i16 * 18,
                 &truncate(line, 42),
                 if i == 0 {
                     self.palette.foreground
@@ -1559,7 +1581,14 @@ pub fn describe_target(state: &State, target: &Target) -> Vec<String> {
 fn describe_common(state: &State) -> String {
     let status = &state.status;
     if status.follows_theme() {
-        format!("Showing the {} theme wallpaper", theme_label(&status.theme))
+        let theme = theme_label(&status.theme);
+        if status.theme_image_is_signature() {
+            format!("Showing the {theme} Signature picture")
+        } else if status.signature_style() {
+            format!("Showing the {theme} artwork (no Signature)")
+        } else {
+            format!("Showing the {theme} theme wallpaper")
+        }
     } else if status.shows_theme_colour() {
         format!(
             "The {} theme has no wallpaper; its background colour is used",
@@ -1603,6 +1632,8 @@ pub enum Hit {
     Scale(u8),
     Rotation(u8),
     FollowTheme,
+    /// "Theme picture: Art/Signature", which switches the style at once.
+    ThemeStyle,
     ScreenFollow,
     Apply,
     Cancel,
@@ -1714,6 +1745,7 @@ pub fn hit_rect(l: &Layout, hit: Hit, state: &State) -> Option<Rectangle> {
         Hit::Scale(i) => *scale_rects(l).get(i as usize)?,
         Hit::Rotation(i) => *rotation_rects(l).get(i as usize)?,
         Hit::FollowTheme => follow_rect(l),
+        Hit::ThemeStyle => style_rect(l),
         Hit::ScreenFollow => settings_rect(l),
         Hit::Apply => apply_rect(l),
         Hit::Cancel => cancel_rect(l),
@@ -1785,6 +1817,9 @@ pub fn hit(w: u16, h: u16, x: i16, y: i16, state: &State) -> Option<Hit> {
     }
     if inside(follow_rect(&l), x, y) {
         return Some(Hit::FollowTheme);
+    }
+    if inside(style_rect(&l), x, y) {
+        return Some(Hit::ThemeStyle);
     }
     if inside(settings_rect(&l), x, y) {
         return Some(Hit::ScreenFollow);
@@ -1972,6 +2007,14 @@ fn follow_rect(l: &Layout) -> Rectangle {
     }
 }
 
+/// "Theme picture: Art/Signature", right below "Follow theme".
+fn style_rect(l: &Layout) -> Rectangle {
+    Rectangle {
+        y: l.panel.y + 226,
+        ..follow_rect(l)
+    }
+}
+
 fn settings_rect(l: &Layout) -> Rectangle {
     Rectangle {
         x: l.panel.x + 12,
@@ -1993,7 +2036,7 @@ fn cancel_rect(l: &Layout) -> Rectangle {
 /// The space for the staged picture's preview: between the description
 /// lines and Apply. `None` when the window is too short for one.
 pub fn preview_rect(l: &Layout) -> Option<Rectangle> {
-    let top = l.panel.y + 306;
+    let top = l.panel.y + 338;
     let bottom = apply_rect(l).y - 10;
     (bottom - top >= 40).then(|| Rectangle {
         x: l.panel.x + 12,
@@ -2195,14 +2238,36 @@ pub fn finish_apply(state: &mut State, result: ApplyResult) {
 pub struct ApplyJob {
     serial: u64,
     started: Option<Instant>,
+    kind: JobKind,
+}
+
+/// What the worker of an `ApplyJob` is doing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum JobKind {
+    /// The staged change.
+    #[default]
+    Apply,
+    /// `niructl wallpaper style toggle`, which keeps the staged change.
+    Style,
 }
 
 impl ApplyJob {
     /// Start a new Apply and return its serial.
     pub fn start(&mut self, now: Instant) -> u64 {
+        self.start_kind(now, JobKind::Apply)
+    }
+
+    /// Start a job of the given kind and return its serial.
+    pub fn start_kind(&mut self, now: Instant, kind: JobKind) -> u64 {
         self.serial += 1;
         self.started = Some(now);
+        self.kind = kind;
         self.serial
+    }
+
+    /// What the current (or last) job is.
+    pub fn kind(&self) -> JobKind {
+        self.kind
     }
 
     /// True when `serial` is the Apply the window is waiting for; it is then
@@ -2252,6 +2317,8 @@ const K_K: u32 = b'k' as u32;
 const K_L: u32 = b'l' as u32;
 const K_A: u32 = b'a' as u32;
 const K_D: u32 = b'd' as u32;
+/// S switches every theme between its artwork and its Signature picture.
+pub const K_S: u32 = b's' as u32;
 const K_F1: u32 = 0xffbe;
 const K_HOME: u32 = 0xff50;
 const K_PAGE_UP: u32 = 0xff55;
@@ -2316,6 +2383,7 @@ pub fn focus_order(state: &State) -> Vec<Hit> {
         out.push(Hit::Rotation(i as u8));
     }
     out.push(Hit::FollowTheme);
+    out.push(Hit::ThemeStyle);
     out.push(Hit::ScreenFollow);
     out.push(Hit::Apply);
     out.push(Hit::Cancel);
@@ -2351,6 +2419,8 @@ pub enum KeyAction {
     /// Start at the first control, or move back to the grid.
     Focus(Option<Hit>),
     Help,
+    /// Switch the theme picture between Art and Signature.
+    ToggleStyle,
 }
 
 pub fn handle_key(state: &mut State, key: u32, _l: &Layout, focus: Option<Hit>) -> KeyAction {
@@ -2367,6 +2437,7 @@ pub fn handle_key(state: &mut State, key: u32, _l: &Layout, focus: Option<Hit>) 
             }
         }
         K_A => KeyAction::Focus(None),
+        K_S => KeyAction::ToggleStyle,
         K_RETURN => match focus {
             Some(control) => KeyAction::Activate(control),
             None => KeyAction::Apply,
@@ -2548,6 +2619,7 @@ pub fn help_lines() -> Vec<&'static str> {
         "Enter              apply, or press the focused control",
         "Ctrl+D             discard the staged changes",
         "A                  return to the picture grid",
+        "S                  theme picture: switch Art and Signature",
         "F1                 show or hide this help",
         "Esc or q           close the window",
         "PageUp/PageDown    move a page; Home/End to the first or last",
@@ -2753,6 +2825,7 @@ fn handle_event(
                     ui.help = true;
                     ui.focus = None;
                 }
+                KeyAction::ToggleStyle => run_style(app, state),
                 KeyAction::Redraw | KeyAction::None => {}
             }
         }
@@ -2960,19 +3033,101 @@ fn collect_apply(app: &mut App, state: &mut State) -> bool {
     let mut changed = false;
     while let Ok((serial, result)) = app.apply_results.try_recv() {
         if app.apply_job.accept(serial) {
-            finish_apply(state, result);
+            match app.apply_job.kind() {
+                JobKind::Apply => finish_apply(state, result),
+                JobKind::Style => finish_style(state, result),
+            }
             changed = true;
         }
     }
     if state.busy && app.apply_job.remaining(Instant::now()) == Some(Duration::ZERO) {
         app.apply_job.abandon();
-        finish_apply(
-            state,
-            Err("Applying took too long; the desktop did not answer. Your changes are still staged.".into()),
-        );
+        match app.apply_job.kind() {
+            JobKind::Apply => finish_apply(
+                state,
+                Err("Applying took too long; the desktop did not answer. Your changes are still staged.".into()),
+            ),
+            JobKind::Style => finish_style(
+                state,
+                Err("the desktop did not answer in time".into()),
+            ),
+        }
         changed = true;
     }
     changed
+}
+
+/// Switch the theme picture style on the Apply worker: niructl writes the
+/// setting and reloads the window manager, which can take as long as an
+/// Apply. Staged changes are kept.
+fn run_style(app: &mut App, state: &mut State) {
+    if state.busy {
+        return;
+    }
+    state.busy = true;
+    let serial = app.apply_job.start_kind(Instant::now(), JobKind::Style);
+    let done = app.apply_done.clone();
+    let wake = app.wake.clone();
+    thread::spawn(move || {
+        let result = backend::toggle_style().and_then(|_| fetch());
+        let _ = done.send((serial, result));
+        wake.notify();
+    });
+}
+
+/// Take the desktop's answer to a style switch into the window state.
+///
+/// Unlike an Apply this keeps whatever is staged. A niructl from before the
+/// setting refuses the command; that is said in the footer, nothing else
+/// changes.
+pub fn finish_style(state: &mut State, result: ApplyResult) {
+    state.busy = false;
+    let (status, list) = match result {
+        Ok(answer) => answer,
+        Err(err) => {
+            let text = if state.status.theme_style_reported {
+                format!("Could not switch the theme picture: {err}")
+            } else {
+                format!("This NIRUWM cannot switch theme pictures; update NIRUX ({err})")
+            };
+            state.set_message(text, true);
+            return;
+        }
+    };
+    let selected = state.current().map(|w| w.path.clone());
+    state.status = status;
+    state.list = list;
+    state.seen = snapshot(&state.status, &state.list);
+    if let Target::Screen(name) = &state.target {
+        if !state.screens().iter().any(|s| s == name) {
+            state.target = Target::All;
+            state.pending = Pending::default();
+        }
+    }
+    if let Some(path) = selected {
+        if let Some(pos) = state.visible().iter().position(|w| w.path == path) {
+            state.selected = pos;
+        }
+    }
+    if state.selected >= state.visible().len() {
+        state.selected = state.visible().len().saturating_sub(1);
+    }
+    let status = &state.status;
+    let text = if !status.theme_style_reported {
+        // The command worked but the report does not carry the setting.
+        "Theme picture switched".to_string()
+    } else if status.signature_style()
+        && !status.theme_image.is_empty()
+        && !status.theme_image_is_signature()
+    {
+        format!(
+            "Theme picture: Signature. {} has no Signature picture, so its artwork stays",
+            theme_label(&status.theme)
+        )
+    } else {
+        format!("Theme picture: {}", status.style_label())
+    };
+    state.set_message(text, false);
 }
 
 /// Activating a control changes the staged settings. Apply is handled by the
@@ -3049,7 +3204,7 @@ fn activate(state: &mut State, control: Hit) {
         }
         // These need the window and are run by `press`; the scrollbar is
         // dragged, not pressed.
-        Hit::Apply | Hit::Scrollbar | Hit::AddPictures | Hit::OpenFolder => {}
+        Hit::Apply | Hit::ThemeStyle | Hit::Scrollbar | Hit::AddPictures | Hit::OpenFolder => {}
         Hit::Cancel => {
             state.pending = Pending::default();
             state.set_message("Discarded staged changes", false);
@@ -3132,6 +3287,7 @@ fn press(app: &mut App, state: &mut State, ui: &mut Ui, control: Hit) {
             let items = import::candidates(&import::source_dirs(), &dir);
             ui.import = Some(ImportView::new(items, dir));
         }
+        Hit::ThemeStyle => run_style(app, state),
         Hit::OpenFolder => {
             let dir = wallpaper_dir(state);
             match open_folder(&dir) {
@@ -3500,6 +3656,7 @@ mod tests {
                 name: format!("Picture {i}"),
                 path: PathBuf::from(format!("/fixture/w{i:02}.png")),
                 official: true,
+                signature: false,
             })
             .collect();
         State {
@@ -3523,6 +3680,115 @@ mod tests {
             palette: Palette::fallback(),
             geometry: Vec::new(),
         }
+    }
+
+    #[test]
+    fn s_switches_the_theme_picture_in_either_case() {
+        let mut state = fixture(4);
+        let l = layout(WIDTH, HEIGHT);
+        for sym in [b's' as u32, b'S' as u32] {
+            let key = keyboard::shortcut(sym);
+            assert!(matches!(
+                handle_key(&mut state, key, &l, None),
+                KeyAction::ToggleStyle
+            ));
+        }
+        assert!(
+            state.pending.is_empty(),
+            "the key stages nothing; niructl applies it"
+        );
+    }
+
+    #[test]
+    fn the_theme_picture_button_sits_below_follow_theme() {
+        let state = fixture(4);
+        for (w, h) in [(WIDTH, HEIGHT), (MIN_WIDTH, MIN_HEIGHT), (500, 900)] {
+            let l = layout(w, h);
+            let follow = follow_rect(&l);
+            let style = style_rect(&l);
+            assert!(!intersects(follow, style));
+            assert!(style.y > follow.y);
+            // The description lines start below it.
+            assert!(style.y + style.height as i16 <= l.panel.y + 262);
+            assert!(style.x + style.width as i16 <= l.panel.x + l.panel.width as i16);
+            assert_eq!(
+                hit(w, h, style.x + 4, style.y + 4, &state),
+                Some(Hit::ThemeStyle)
+            );
+            assert_eq!(
+                hit(w, h, follow.x + 4, follow.y + 4, &state),
+                Some(Hit::FollowTheme)
+            );
+        }
+        // At the smallest size the three description lines still end above
+        // Apply.
+        let l = layout(MIN_WIDTH, MIN_HEIGHT);
+        assert!(apply_rect(&l).y >= l.panel.y + 262 + 3 * 18);
+        let order = focus_order(&state);
+        let at = order.iter().position(|h| *h == Hit::FollowTheme).unwrap();
+        assert_eq!(order[at + 1], Hit::ThemeStyle);
+    }
+
+    #[test]
+    fn a_style_switch_keeps_the_staged_change_and_reports_the_style() {
+        let mut state = fixture(4);
+        state.pending.scale = Some("fit".into());
+        state.busy = true;
+        let mut status = state.status.clone();
+        status.theme = "niru-nord".into();
+        status.theme_style = "signature".into();
+        status.theme_style_reported = true;
+        status.theme_image = "/w/nirux-wallpaper-signature-nord-4k.png".into();
+        let list = state.list.clone();
+        finish_style(&mut state, Ok((status, list)));
+        assert!(!state.busy);
+        assert_eq!(state.pending.scale.as_deref(), Some("fit"));
+        assert_eq!(state.message, "Theme picture: Signature");
+        assert!(!state.message_is_error);
+        assert_eq!(
+            describe_common(&state),
+            "Showing the Nord Signature picture"
+        );
+
+        // A theme without a Signature picture keeps its artwork, and says so.
+        let mut status = state.status.clone();
+        status.theme_image = "/w/nirux-wallpaper-nord-4k.png".into();
+        let list = state.list.clone();
+        finish_style(&mut state, Ok((status, list)));
+        assert!(state.message.contains("no Signature picture"));
+        assert_eq!(
+            describe_common(&state),
+            "Showing the Nord artwork (no Signature)"
+        );
+    }
+
+    #[test]
+    fn an_old_niructl_refusing_the_style_is_a_notice_not_a_crash() {
+        let mut state = fixture(4);
+        state.busy = true;
+        state.pending.rotation = Some(5);
+        finish_style(&mut state, Err("usage: niructl ...".into()));
+        assert!(!state.busy);
+        assert!(state.message_is_error);
+        assert!(state.message.contains("update NIRUX"), "{}", state.message);
+        assert_eq!(state.pending.rotation, Some(5));
+        state.status.theme_style_reported = true;
+        finish_style(&mut state, Err("no answer".into()));
+        assert!(state
+            .message
+            .starts_with("Could not switch the theme picture"));
+    }
+
+    #[test]
+    fn a_job_remembers_whether_it_is_an_apply_or_a_style_switch() {
+        let mut job = ApplyJob::default();
+        let now = Instant::now();
+        let first = job.start(now);
+        assert_eq!(job.kind(), JobKind::Apply);
+        let second = job.start_kind(now, JobKind::Style);
+        assert_eq!(job.kind(), JobKind::Style);
+        assert!(!job.accept(first));
+        assert!(job.accept(second));
     }
 
     #[test]
@@ -4047,8 +4313,8 @@ mod hint_tests {
         let h = normal_hints();
         assert_eq!(h[0] & (1 << 5), 0, "PMaxSize must not be set");
         assert_eq!(h[0], 1 << 3 | 1 << 4);
-        assert_eq!((h[3], h[4]), (1000, 690));
-        assert_eq!((h[5], h[6]), (660, 500));
+        assert_eq!((h[3], h[4]), (1000, 720));
+        assert_eq!((h[5], h[6]), (660, 540));
         assert!(h[7..].iter().all(|v| *v == 0));
     }
 }

@@ -8,7 +8,7 @@
 use std::{
     io::Read,
     os::unix::io::AsRawFd,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Command, Output, Stdio},
     time::{Duration, Instant},
 };
@@ -28,6 +28,9 @@ pub struct Wallpaper {
     /// True when the image came from the theme directory, so it belongs to a
     /// NIRUX theme rather than to the user's own collection.
     pub official: bool,
+    /// True for a theme's Signature picture (`nirux-wallpaper-signature-*`):
+    /// the NIRUX photo tinted in that theme's colours.
+    pub signature: bool,
 }
 
 /// One screen and what the configuration says it shows.
@@ -80,6 +83,12 @@ pub struct Status {
     pub file: String,
     pub dir: String,
     pub theme_dir: String,
+    /// Which picture a theme shows: `art` (its own artwork) or `signature`
+    /// (the tinted NIRUX photo, when the theme has one). `art` when niructl
+    /// does not say, as a niructl from before the setting does not.
+    pub theme_style: String,
+    /// True when niructl reported `theme_style`, so it knows the setting.
+    pub theme_style_reported: bool,
     pub theme: String,
     /// The image the theme would use now, empty when the theme has none.
     pub theme_image: String,
@@ -169,6 +178,79 @@ impl Status {
     pub fn rotation_possible(&self) -> bool {
         self.mode != "single"
     }
+
+    /// True when themes show their Signature picture rather than the artwork.
+    pub fn signature_style(&self) -> bool {
+        self.theme_style == "signature"
+    }
+
+    /// The style as the window names it: "Art" or "Signature".
+    pub fn style_label(&self) -> &'static str {
+        style_label(&self.theme_style)
+    }
+
+    /// True when the theme picture in use is a Signature picture. With the
+    /// Signature style chosen, a theme without one shows its artwork.
+    pub fn theme_image_is_signature(&self) -> bool {
+        is_signature_file(Path::new(&self.theme_image))
+    }
+}
+
+/// Read a `theme_style` value tolerantly: anything but `signature` is the
+/// default, `art`.
+pub fn normalize_style(value: &str) -> String {
+    if value.trim().eq_ignore_ascii_case("signature") {
+        "signature".into()
+    } else {
+        "art".into()
+    }
+}
+
+/// "Art" or "Signature", for a `theme_style` value.
+pub fn style_label(style: &str) -> &'static str {
+    if style == "signature" {
+        "Signature"
+    } else {
+        "Art"
+    }
+}
+
+/// The theme a Signature picture belongs to, as its file names it:
+/// `nirux-wallpaper-signature-nord-4k.png` gives `nord`.
+pub fn signature_slug(path: &Path) -> Option<String> {
+    let stem = path.file_stem()?.to_str()?;
+    let rest = stem.strip_prefix("nirux-wallpaper-signature-")?;
+    let rest = rest
+        .strip_suffix("-4k")
+        .or_else(|| rest.strip_suffix("-8k"))
+        .unwrap_or(rest);
+    (!rest.is_empty()).then(|| rest.to_string())
+}
+
+pub fn is_signature_file(path: &Path) -> bool {
+    signature_slug(path).is_some()
+}
+
+/// The list label of a Signature picture: "Signature" and the theme's name,
+/// so the ten of them read as one group and not as ten more themes.
+pub fn signature_label(slug: &str) -> String {
+    let theme = THEMES
+        .iter()
+        .find(|(s, _)| s.strip_prefix("niru-") == Some(slug))
+        .map(|(_, label)| (*label).to_string())
+        .unwrap_or_else(|| {
+            slug.split('-')
+                .filter(|p| !p.is_empty())
+                .map(|p| {
+                    let mut c = p.chars();
+                    c.next()
+                        .map(|f| f.to_uppercase().collect::<String>() + c.as_str())
+                        .unwrap_or_default()
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        });
+    format!("Signature {theme}")
 }
 
 /// Find the control command the desktop already installed.
@@ -343,6 +425,7 @@ pub fn parse_status(text: &str) -> Status {
     let mut status = Status {
         mode: "random".into(),
         scale: "fill".into(),
+        theme_style: "art".into(),
         ..Status::default()
     };
     for line in text.lines() {
@@ -364,6 +447,10 @@ pub fn parse_status(text: &str) -> Status {
             // value must not be mistaken for an unset key.
             "theme_image" => status.theme_image = value,
             "theme_following" => status.theme_following = value,
+            "theme_style" => {
+                status.theme_style = normalize_style(&value);
+                status.theme_style_reported = true;
+            }
             _ => {}
         }
     }
@@ -374,7 +461,8 @@ pub fn parse_status(text: &str) -> Status {
 pub fn parse_list(text: &str, theme_dir: &str) -> Vec<Wallpaper> {
     let theme_root = PathBuf::from(expand_home(theme_dir));
     let theme_root = theme_root.canonicalize().unwrap_or(theme_root);
-    text.lines()
+    let mut out: Vec<Wallpaper> = text
+        .lines()
         .filter_map(|line| {
             let (name, path) = line.split_once('\t')?;
             if name.trim().is_empty() || path.trim().is_empty() {
@@ -385,13 +473,24 @@ pub fn parse_list(text: &str, theme_dir: &str) -> Vec<Wallpaper> {
             // membership in that directory is enough to call an entry official.
             let identity = path.canonicalize().unwrap_or_else(|_| path.clone());
             let official = identity.starts_with(&theme_root);
+            // A theme's Signature picture is labelled as such, so it does not
+            // read as a duplicate of the theme.
+            let slug = official.then(|| signature_slug(&path)).flatten();
             Some(Wallpaper {
-                name: name.trim().to_string(),
+                name: slug
+                    .as_deref()
+                    .map(signature_label)
+                    .unwrap_or_else(|| name.trim().to_string()),
                 path,
                 official,
+                signature: slug.is_some(),
             })
         })
-        .collect()
+        .collect();
+    // The Signature pictures follow the theme artwork as one group; the
+    // order within each group, and of the user's own pictures, is kept.
+    out.sort_by_key(|w| (!w.official, w.signature));
+    out
 }
 
 // The JSON report is a flat map of strings, booleans, numbers and arrays of
@@ -570,6 +669,7 @@ pub fn parse_json(text: &str) -> Option<Status> {
         mode: "random".into(),
         scale: "fill".into(),
         structured: true,
+        theme_style: "art".into(),
         ..Status::default()
     };
     for (key, _) in &members {
@@ -584,6 +684,10 @@ pub fn parse_json(text: &str) -> Option<Status> {
             "theme_dir" => status.theme_dir = json_string_field(&members, key),
             "theme" => status.theme = json_string_field(&members, key),
             "theme_image" => status.theme_image = json_string_field(&members, key),
+            "theme_style" => {
+                status.theme_style = normalize_style(&json_string_field(&members, key));
+                status.theme_style_reported = true;
+            }
             _ => {}
         }
     }
@@ -679,6 +783,26 @@ pub fn set_scale(scale: &str) -> Result<(), String> {
 #[allow(dead_code)] // the window sends these through `Change`; kept for scripts
 pub fn set_rotation(minutes: u32) -> Result<(), String> {
     run(&["wallpaper", "rotation", &minutes.to_string()]).map(|_| ())
+}
+
+/// The arguments that switch every theme between its artwork and its
+/// Signature picture. niructl writes the setting and reloads NIRUWM.
+pub const STYLE_TOGGLE: [&str; 3] = ["wallpaper", "style", "toggle"];
+
+/// Switch the theme picture style and return the style niructl reports
+/// (`art` or `signature`), or `None` when it printed nothing recognisable.
+/// The reload composes every screen again, so it gets the Apply deadline.
+pub fn toggle_style() -> Result<Option<String>, String> {
+    let out = run_within(&STYLE_TOGGLE, APPLY_DEADLINE)?;
+    Ok(parse_style_answer(&String::from_utf8_lossy(&out.stdout)))
+}
+
+/// Read `theme_style=<value>` from what `niructl wallpaper style` printed.
+pub fn parse_style_answer(text: &str) -> Option<String> {
+    text.lines()
+        .filter_map(|l| l.split_once('='))
+        .find(|(k, _)| k.trim() == "theme_style")
+        .map(|(_, v)| normalize_style(v))
 }
 
 #[allow(dead_code)] // the window sends these through `Change`; kept for scripts
@@ -1021,6 +1145,101 @@ Holiday\t/home/u/Pictures/holiday.png\n\nbroken line without tab\n";
         assert_eq!(out.status.code(), Some(3));
         assert_eq!(String::from_utf8_lossy(&out.stdout).lines().count(), 20000);
         assert_eq!(out.stderr, b"oops\n");
+    }
+
+    #[test]
+    fn a_status_without_theme_style_means_art() {
+        // An older niructl prints no theme_style line and no JSON field.
+        let s = parse_status(SAMPLE);
+        assert_eq!(s.theme_style, "art");
+        assert!(!s.theme_style_reported);
+        assert!(!s.signature_style());
+        assert_eq!(s.style_label(), "Art");
+        let j = parse_json(JSON).expect("valid report");
+        assert_eq!(j.theme_style, "art");
+        assert!(!j.theme_style_reported);
+    }
+
+    #[test]
+    fn theme_style_is_read_from_both_reports() {
+        let text = format!(
+            "{SAMPLE}theme_style=signature\n\
+theme_image=/w/NIRU/nirux-wallpaper-signature-nord-4k.png\n"
+        );
+        let s = parse_status(&text);
+        assert_eq!(s.theme_style, "signature");
+        assert!(s.theme_style_reported);
+        assert_eq!(s.style_label(), "Signature");
+        assert!(s.theme_image_is_signature());
+        let json = JSON.replacen(
+            "\"theme\": \"niru-nord\",",
+            "\"theme\": \"niru-nord\", \"theme_style\": \"signature\",",
+            1,
+        );
+        let j = parse_json(&json).expect("valid report");
+        assert!(j.signature_style());
+        assert!(j.theme_style_reported);
+        assert!(!j.theme_image_is_signature(), "the artwork is still shown");
+        let art = parse_json(r#"{"theme_style": "art"}"#).unwrap();
+        assert_eq!(art.theme_style, "art");
+        assert!(art.theme_style_reported);
+    }
+
+    #[test]
+    fn theme_style_parsing_is_tolerant() {
+        for (value, want) in [
+            ("signature", "signature"),
+            (" Signature ", "signature"),
+            ("art", "art"),
+            ("", "art"),
+            ("photo", "art"),
+        ] {
+            let s = parse_status(&format!("theme_style={value}\n"));
+            assert_eq!(s.theme_style, want, "{value:?}");
+        }
+        assert_eq!(
+            parse_style_answer("theme_style=signature\n"),
+            Some("signature".into())
+        );
+        assert_eq!(parse_style_answer("reloaded\n"), None);
+        assert_eq!(STYLE_TOGGLE, ["wallpaper", "style", "toggle"]);
+    }
+
+    #[test]
+    fn signature_pictures_are_labelled_and_grouped_after_the_artwork() {
+        let dir = "/fixture/NIRU";
+        let text = "Blood of Urdr\t/fixture/NIRU/nirux-wallpaper-blood-of-urdr-4k.png\n\
+Signature Blood Of Urdr\t/fixture/NIRU/nirux-wallpaper-signature-blood-of-urdr-4k.png\n\
+Signature Nord\t/fixture/NIRU/nirux-wallpaper-signature-nord-4k.png\n\
+The Norns\t/fixture/NIRU/nirux-wallpaper-the-norns-4k.png\n\
+Mine\t/home/u/Pictures/Wallpapers/nirux-wallpaper-signature-nord-4k.png\n";
+        let entries = parse_list(text, dir);
+        let names: Vec<&str> = entries.iter().map(|w| w.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "Blood of Urdr",
+                "The Norns",
+                "Signature Blood of Urdr",
+                "Signature Nord",
+                "Mine"
+            ]
+        );
+        assert!(entries[2].signature && entries[2].official);
+        assert!(!entries[0].signature);
+        assert!(
+            !entries[4].signature,
+            "only the theme directory holds Signature pictures"
+        );
+        assert_eq!(signature_label("some-new-one"), "Signature Some New One");
+        assert_eq!(
+            signature_slug(Path::new("/x/nirux-wallpaper-signature-noir.png")),
+            Some("noir".into())
+        );
+        assert_eq!(
+            signature_slug(Path::new("/x/nirux-wallpaper-noir-4k.png")),
+            None
+        );
     }
 
     #[test]

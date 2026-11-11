@@ -22,6 +22,15 @@ window manager about what is shown.
 
 - **Follow the theme:** use the selected NIRUX theme's own wallpaper, so a
   theme change also changes the wallpaper.
+- **Art or Signature theme picture:** each theme can show its own artwork
+  (**Art**, the default) or its **Signature** picture, one NIRUX photo tinted in
+  that theme's colours. The panel button *Theme picture* (or the `S` key) runs
+  `niructl wallpaper style toggle`, which saves `[wallpaper] theme_style` and
+  reloads NIRUWM at once; staged changes are kept. A theme without a Signature
+  picture keeps its artwork. The Signature pictures are listed under
+  **Official themes** after the artwork, labelled *Signature Nord* and so on.
+  This needs a NIRUWM with the setting; an older `niructl` refuses the command
+  and the window says so.
 - **Choose a theme wallpaper:** keep the current theme but show another
   picture from the installed set, including the Carl Larsson and Erik Satie
   colour variants after `nirux wallpapers download extras` (listed under
@@ -86,6 +95,7 @@ niruwallpaper --help
 | `Enter` | Apply, or press the focused control |
 | `Ctrl+D` | Discard the staged change |
 | `A` | Return to the picture grid |
+| `S` | Switch the theme picture between Art and Signature (takes effect at once) |
 | `F1` | Show or hide help |
 | `Esc` or `q` | Close |
 
