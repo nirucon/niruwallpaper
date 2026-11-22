@@ -52,6 +52,18 @@ pub fn screen_in_frame(frame: Area, screen: (u32, u32)) -> Area {
 pub fn place(on: Area, screen: (u32, u32), image: (u32, u32), scale: &str) -> Area {
     let (iw, ih) = (f64::from(image.0.max(1)), f64::from(image.1.max(1)));
     let (ow, oh) = (f64::from(on.w), f64::from(on.h));
+    // NIRUWM's smart: crop when the shapes are close, otherwise the whole
+    // picture (over a blurred copy, which the preview leaves out).
+    let scale = if scale == "smart" {
+        let (ri, ro) = (iw / ih, ow / oh);
+        if ri.max(ro) / ri.min(ro) <= 1.2 {
+            "fill"
+        } else {
+            "fit"
+        }
+    } else {
+        scale
+    };
     let (w, h) = match scale {
         "stretch" => (ow, oh),
         "fit" => {
@@ -129,6 +141,27 @@ mod tests {
         assert!(big.w > on.w * 3);
         assert_eq!(big.intersect(on), Some(on));
         // The aspect ratio is kept by every mode but stretch.
+        // smart: 16:9 on 16:10 fills, 16:9 on 21:9 shows the whole picture.
+        let screen = Area {
+            x: 0,
+            y: 0,
+            w: 1600,
+            h: 1000,
+        };
+        assert_eq!(
+            place(screen, (1920, 1200), (3840, 2160), "smart"),
+            place(screen, (1920, 1200), (3840, 2160), "fill")
+        );
+        let ultra = Area {
+            x: 0,
+            y: 0,
+            w: 2150,
+            h: 900,
+        };
+        assert_eq!(
+            place(ultra, (3440, 1440), (3840, 2160), "smart"),
+            place(ultra, (3440, 1440), (3840, 2160), "fit")
+        );
         for mode in ["fill", "fit", "center"] {
             let p = place(on, (1920, 1080), photo, mode);
             let ratio = f64::from(p.w) / f64::from(p.h);

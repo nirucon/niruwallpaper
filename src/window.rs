@@ -1973,7 +1973,7 @@ fn tile_rect(l: &Layout, index: usize, scroll: usize) -> Rectangle {
     }
 }
 
-const SCALES: [&str; 4] = ["fill", "fit", "stretch", "center"];
+const SCALES: [&str; 5] = ["smart", "fill", "fit", "stretch", "center"];
 const ROTATIONS: [u32; 5] = [0, 5, 10, 30, 60];
 
 /// `count` buttons side by side across the panel, `gap` pixels apart.
